@@ -104,6 +104,40 @@ describe("auxiliary LSP enablement", () => {
 			_resetSubagentModeForTests();
 		}
 	});
+
+	// Gentle Shell's vocabulary reaches the same #713 seam, so the existing gate
+	// and its escape hatch apply without a second skip mechanism here. Each case
+	// below sets its marker itself: the runner's own subagent vocabulary never
+	// reaches a case, because `tests/support/vitest-setup.ts` deletes it for
+	// every test file (a Gentle Shell child lane inherits
+	// `GENTLE_PI_AGENTS_CHILD=1`, which turned the three default-on cases above
+	// into light-mode cases: 3 red there, 0 with the marker unset).
+	it("Gentle Shell child returns empty auxiliary set (#713 vocabulary)", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		_resetSubagentModeForTests();
+		try {
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
+		} finally {
+			delete process.env.GENTLE_PI_AGENTS_CHILD;
+			_resetSubagentModeForTests();
+		}
+	});
+
+	it("PI_LENS_SUBAGENT_FULL=1 restores auxiliaries inside a Gentle Shell child", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		process.env.PI_LENS_SUBAGENT_FULL = "1";
+		_resetSubagentModeForTests();
+		try {
+			const ids = enabledAuxiliaryLspServerIds(() => undefined);
+			expect(ids).toContain("opengrep");
+			expect(ids).toContain("zizmor");
+			expect(ids).toContain("typos");
+		} finally {
+			delete process.env.GENTLE_PI_AGENTS_CHILD;
+			delete process.env.PI_LENS_SUBAGENT_FULL;
+			_resetSubagentModeForTests();
+		}
+	});
 });
 
 describe("configDisabledAuxiliaryLspServerIds (#4323)", () => {

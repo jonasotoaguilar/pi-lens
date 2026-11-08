@@ -1,7 +1,7 @@
 /**
  * Subagent light mode (#449 slice 0; broadened #507).
  *
- * Two known subagent-spawning ecosystems set different env vocabularies in
+ * Subagent-spawning ecosystems set different env vocabularies in
  * every spawned child's environment:
  *
  * - nicobailon/pi-subagents sets `PI_SUBAGENT_CHILD=1` unconditionally on
@@ -19,6 +19,7 @@
  *   spawns, full env inheritance — but never sets `PI_SUBAGENT_CHILD`. It sets
  *   `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` instead (#507,
  *   grep-verified against avtc-pi-subagent@1.0.3).
+ * - Gentle Shell sets `GENTLE_PI_AGENTS_CHILD=1` for child processes.
  *
  * Every child currently loads pi-lens fully by default, so a fan-out of N
  * subagents pays N full LSP pre-warms + N sets of heavyweight startup scans
@@ -35,14 +36,14 @@
  * LSP dispatch is untouched — light mode must not disable diagnostics.
  *
  * Escape hatch: `PI_LENS_SUBAGENT_FULL=1` forces full (non-light) behavior
- * even inside a detected subagent session, for either vocabulary.
+ * even inside a detected subagent session, for any vocabulary.
  *
  * Follows the lazy-memoized-config house style (see `runtime-config.ts` /
  * `slow-fs.ts`): env values are read lazily at call time, not module load.
  */
 
 /** Which vocabulary matched when classifying the session as a subagent. */
-type SubagentMarker = "pi-subagents" | "avtc-pi-subagent";
+type SubagentMarker = "pi-subagents" | "avtc-pi-subagent" | "gentle-shell";
 
 interface SubagentClassification {
 	isSubagent: boolean;
@@ -68,13 +69,19 @@ function classifySubagentSession(): SubagentClassification {
 		return cachedClassification;
 	}
 
+	if (process.env.GENTLE_PI_AGENTS_CHILD === "1") {
+		cachedClassification = { isSubagent: true, marker: "gentle-shell" };
+		return cachedClassification;
+	}
+
 	cachedClassification = { isSubagent: false };
 	return cachedClassification;
 }
 
 /** True iff pi-lens is running inside a detected subagent child `pi` process
  * (nicobailon/pi-subagents' `PI_SUBAGENT_CHILD=1`, or avtc-pi-subagent's
- * `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair), and the caller
+ * `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, or Gentle Shell's
+ * `GENTLE_PI_AGENTS_CHILD=1`), and the caller
  * has not forced full behavior via the escape hatch. */
 export function isSubagentSession(): boolean {
 	if (process.env.PI_LENS_SUBAGENT_FULL === "1") return false;

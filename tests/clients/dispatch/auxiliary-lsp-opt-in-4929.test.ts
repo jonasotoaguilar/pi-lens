@@ -13,6 +13,14 @@
  *    resolution, not a hand-shaped getFlag.
  *  - shape 87 (#4913): the flag is read per call, never captured, so a value
  *    the host applies after the factory runs still decides.
+ *  - ambient vocabulary: `enabledAuxiliaryLspServerIds` answers `[]` inside any
+ *    detected subagent session, and this suite is itself run from subagent
+ *    children (Gentle Shell sets `GENTLE_PI_AGENTS_CHILD=1`, which the worker
+ *    inherits). An inherited marker turned every default-on case into a
+ *    light-mode case — 4 red on a Gentle Shell child lane, 0 with the marker
+ *    unset. The posture is pinned once for every test file
+ *    (`tests/support/vitest-setup.ts` deletes the whole vocabulary), not per
+ *    file, so the gate cases here read the environment a case chooses.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
