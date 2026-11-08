@@ -69,6 +69,14 @@ describe("isSubagentSession", () => {
 		expect(getSubagentIdentity()?.marker).toBe("pi-subagents");
 	});
 
+	it("keeps the avtc pair's precedence when the Gentle marker is also set", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		process.env.PI_SUBAGENT_CHILD_AGENT = "reviewer-1";
+		process.env.PI_SUBAGENT_PARENT_PID = "12345";
+		expect(isSubagentSession()).toBe(true);
+		expect(getSubagentIdentity()?.marker).toBe("avtc-pi-subagent");
+	});
+
 	it("is false when PI_SUBAGENT_CHILD is unset", () => {
 		expect(isSubagentSession()).toBe(false);
 	});

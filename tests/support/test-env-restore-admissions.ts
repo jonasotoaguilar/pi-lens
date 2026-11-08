@@ -380,7 +380,7 @@ export const TEST_ENV_RESTORE_ADMISSIONS: Readonly<
 	"tests/support/vitest-setup.ts": {
 		mechanism: "module-pin",
 		reason:
-			"global setup pins the machine-global variables once for the process and deletes the whole subagent vocabulary at load, before any case: the jiti cache switches (#4673) and the absence of an inherited marker both have to hold for the whole worker, so restoring either would re-enable the write between cases (a Gentle Shell lane inherits GENTLE_PI_AGENTS_CHILD=1)",
+			"global setup pins the machine-global variables once for the process and deletes the whole subagent vocabulary at load, through the key list `clients/subagent-mode.ts` exports, before any case: the jiti cache switches (#4673) and the absence of an inherited marker both have to hold for the whole worker, so restoring either would re-enable the write between cases (a Gentle Shell lane inherits GENTLE_PI_AGENTS_CHILD=1)",
 	},
 	"tests/support/with-env.test.ts": {
 		mechanism: "teardown",
