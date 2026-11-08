@@ -392,6 +392,24 @@ export function getInstanceRoots(entry: InstanceEntry): string[] {
 }
 
 /**
+ * The roots of `entry` that are EVIDENCE of where its host works, as opposed to
+ * a synthesized guess: {@link getInstanceRoots}, minus the index-0 root of an
+ * `rootSource: "lsp-fallback"` entry.
+ *
+ * The owner of this rule. `rootSource` is this module's own field, and only
+ * ever describes index 0 — the `process.cwd()` `recordLspChild` invents for a
+ * host entry it had to synthesize before `registerInstance` ran (#2130). A
+ * caller asking "does this host actually serve root X" (the shared-checkout
+ * guard's peers, the subagent auxiliary peer-coverage probe) must ask THIS
+ * function: a match on a guessed root says nothing about which tree that
+ * process scans. Roots appended to the entry after it are real and stay.
+ */
+export function getAuthoritativeInstanceRoots(entry: InstanceEntry): string[] {
+	const roots = getInstanceRoots(entry);
+	return entry.rootSource === "lsp-fallback" ? roots.slice(1) : roots;
+}
+
+/**
  * Bound on the per-host root set (#2130). A host that legitimately serves many
  * worktrees must not grow an unbounded path list inside a file every other
  * pi-lens process reads on every heartbeat. Eviction drops the OLDEST

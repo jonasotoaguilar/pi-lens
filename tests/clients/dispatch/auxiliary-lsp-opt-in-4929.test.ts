@@ -13,14 +13,19 @@
  *    resolution, not a hand-shaped getFlag.
  *  - shape 87 (#4913): the flag is read per call, never captured, so a value
  *    the host applies after the factory runs still decides.
- *  - ambient vocabulary: `enabledAuxiliaryLspServerIds` answers `[]` inside any
- *    detected subagent session, and this suite is itself run from subagent
- *    children (Gentle Shell sets `GENTLE_PI_AGENTS_CHILD=1`, which the worker
- *    inherits). An inherited marker turned every default-on case into a
- *    light-mode case — 4 red on a Gentle Shell child lane, 0 with the marker
- *    unset. The posture is pinned once for every test file
- *    (`tests/support/vitest-setup.ts` deletes the whole vocabulary), not per
- *    file, so the gate cases here read the environment a case chooses.
+ *  - ambient vocabulary: the auxiliary gate's subagent arm is peer coverage,
+ *    not the marker alone — `enabledAuxiliaryLspServerIds` skips the fleet only
+ *    while a live peer instance is registered on this session's OWN project
+ *    root (`clients/dispatch/auxiliary-lsp.ts`'s peer-coverage probe), so an
+ *    inherited marker no longer empties the list here. The vocabulary is
+ *    pinned anyway, once for every test file (`tests/support/vitest-setup.ts`
+ *    deletes the whole list `clients/subagent-mode.ts` owns), so a case's
+ *    subagent posture is the one it sets and never the one its lane handed
+ *    it: under the older, marker-only gate an inherited
+ *    `GENTLE_PI_AGENTS_CHILD=1` turned every default-on case into a light-mode
+ *    case — 4 red on a Gentle Shell child lane, 0 with the marker unset — and
+ *    the pin is what keeps a future gate change from making this suite's
+ *    verdict depend on its parent process again.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
