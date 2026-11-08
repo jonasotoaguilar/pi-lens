@@ -358,3 +358,126 @@ describe("the row a reader sees matches what the install did (#1500)", () => {
 		expect(lastInstallEvidence()).toMatchObject({ install: "failed" });
 	});
 });
+
+/**
+ * D5 (Gentle Shell audit): auto-install is serialized by ONE machine-global
+ * install lock. A child that lost that race waited out its whole budget and then
+ * spent the session without the tool — it recorded `skipped` without asking
+ * again, even when the winner had already installed the binary.
+ *
+ * These cases hold the real legacy lock file with a live owner (no second
+ * process, no network) and drive the waiter's bound through
+ * `PI_LENS_INSTALL_LOCK_TIMEOUT_MS`, the lever `installer/install-lock.test.ts`
+ * uses. The binary appears mid-wait, which is what a concurrent installer's
+ * success looks like to this process.
+ */
+describe("the loser of the install-lock race (D5)", () => {
+	/** The waiter's whole budget in these cases. */
+	const LOCK_WAIT_MS = 200;
+	const LEGACY_LOCK = (): string =>
+		path.join(piLensHome, "tools", ".install.lock");
+	let restoreLockEnv: () => void;
+	let installCommands: string[];
+
+	/** The probe answer for a tool that is not installed. */
+	const notFound = { stdout: "", stderr: "", status: 1 };
+
+	beforeEach(() => {
+		restoreLockEnv = withEnv({
+			PI_LENS_INSTALL_LOCK_TIMEOUT_MS: String(LOCK_WAIT_MS),
+		});
+		installCommands = [];
+		// Another process holds the machine-global lock: a live owner and a fresh
+		// file, which is exactly what `acquireInstallLock` reads.
+		fs.mkdirSync(path.join(piLensHome, "tools"), { recursive: true });
+		fs.writeFileSync(
+			LEGACY_LOCK(),
+			JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+		);
+	});
+
+	afterEach(() => {
+		restoreLockEnv();
+		fs.rmSync(path.join(piLensHome, "tools", ".install.locks"), {
+			recursive: true,
+			force: true,
+		});
+	});
+
+	it("takes the binary the winner installed instead of skipping the session", async () => {
+		safeSpawnAsync.mockImplementation(
+			async (command: string, args: string[]) => {
+				if (args.includes("install")) {
+					installCommands.push(`${command} ${args.join(" ")}`);
+					return npmOk;
+				}
+				// Present only once the concurrent install has landed.
+				const planted = fs.existsSync(
+					path.join(piLensHome, "tools", "node_modules", ".bin", "fish-lsp"),
+				);
+				return planted ? npmOk : notFound;
+			},
+		);
+		const { ensureTool, getInstallAttempt, getInstallFailureReason } =
+			await installer();
+
+		const pending = ensureTool("fish-lsp");
+		// The winner's install completes while this process is still waiting.
+		setTimeout(plantFishLspBinary, 50);
+		const resolved = await pending;
+
+		expect(getInstallAttempt("fish-lsp")).toMatchObject({
+			outcome: "succeeded",
+			reason: "installed by a concurrent process",
+		});
+		expect(resolved).toMatch(/fish-lsp(\.cmd|\.exe)?$/);
+		expect(fs.existsSync(resolved as string)).toBe(true);
+		// A winner's install is not this process's refusal.
+		expect(getInstallFailureReason("fish-lsp")).toBeUndefined();
+		// Losers take the winner's binary; none of them runs a package manager.
+		expect(installCommands).toEqual([]);
+	});
+
+	it("still records the skip, with its reason, when the bounded wait expires with nothing to take", async () => {
+		safeSpawnAsync.mockImplementation(
+			async (command: string, args: string[]) => {
+				if (args.includes("install")) {
+					installCommands.push(`${command} ${args.join(" ")}`);
+				}
+				return notFound;
+			},
+		);
+		const { ensureTool, getInstallAttempt } = await installer();
+
+		expect(await ensureTool("fish-lsp")).toBeUndefined();
+		const attempt = getInstallAttempt("fish-lsp");
+		expect(attempt?.outcome).toBe("skipped");
+		expect(attempt?.reason).toContain(
+			`timed out after ${LOCK_WAIT_MS}ms waiting for shared tools install lock`,
+		);
+		expect(describeInstallAttempt(attempt)).toMatchObject({
+			install: "not-attempted",
+		});
+		expect(installCommands).toEqual([]);
+	});
+
+	it("records a genuine install failure as failed, not skipped, once the lock frees", async () => {
+		safeSpawnAsync.mockImplementation(
+			async (command: string, args: string[]) => {
+				if (!args.includes("install")) return notFound;
+				installCommands.push(`${command} ${args.join(" ")}`);
+				return npmFailed;
+			},
+		);
+		const { ensureTool, getInstallAttempt } = await installer();
+
+		// The peer holds the lock for this whole budget and installs nothing.
+		expect(await ensureTool("fish-lsp")).toBeUndefined();
+		expect(getInstallAttempt("fish-lsp")?.outcome).toBe("skipped");
+
+		// The peer is gone. This process now runs its OWN install, which fails.
+		fs.rmSync(LEGACY_LOCK(), { force: true });
+		expect(await ensureTool("fish-lsp")).toBeUndefined();
+		expect(getInstallAttempt("fish-lsp")?.outcome).toBe("failed");
+	});
+});
