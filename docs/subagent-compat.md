@@ -2,7 +2,7 @@
 
 pi-lens's subagent-compatibility features — #475 (subagent light mode), #474
 (instance registry + orphan LSP reaper), and #473 (concurrent-session guard) —
-were all built on **reverse-engineered facts** about two third-party pi
+were all built on **reverse-engineered facts** about third-party pi
 extensions and the pi SDK itself. Nobody has promised us these stay true
 across their releases. This doc records exactly what we depend on, where, and
 how the nightly `compat-smoke` workflow (`.github/workflows/compat-smoke.yml`)
@@ -49,11 +49,43 @@ degraded state this vocabulary is now always in. `checkNicobailonChildEnv`
 no longer requires them; only the `PI_SUBAGENT_CHILD='1'` flag pi-lens's
 light-mode detection actually depends on behaviorally still gates the check.
 
+## The Gentle Shell vocabulary (detected, no nightly contract)
+
+Gentle Shell's agent runner sets `GENTLE_PI_AGENTS_CHILD=1` in the environment
+of every child `pi` it spawns, and never sets `PI_SUBAGENT_CHILD` — so a
+Gentle Shell fan-out paid full startup cost in every child until
+`isSubagentSession()` learned this third vocabulary (`clients/subagent-mode.ts`,
+`marker: "gentle-shell"`). It is observed against the local Gentle Shell
+checkout rather than an npm package, so no Layer A check pins it and no
+contract row above covers it; re-assess if Gentle Shell ships through a
+registry with a stable version.
+
+Light mode here is the SAME gate set the other two vocabularies get, because
+the marker only feeds `isSubagentSession()`:
+
+- `session_start` skips the dominant-language LSP pre-warm
+  (`clients/runtime-session.ts`), while per-edit LSP dispatch is untouched.
+- The eight heavyweight external-CLI startup scans (`knip`, `jscpd`, `madge`,
+  `dead-code`, `govulncheck`, `gitleaks`, `trivy`, `opengrep`) are skipped, with the
+  one-per-session light-mode notice.
+- `enabledAuxiliaryLspServerIds()` returns no auxiliary servers
+  (`clients/dispatch/auxiliary-lsp.ts`): the parent on the same cwd already
+  runs opengrep, ast-grep, zizmor and typos.
+
+Indexes such as the symbol index are NOT covered by light mode — the same
+accepted scope as the other vocabularies. `PI_LENS_SUBAGENT_FULL=1` stays the
+universal opt-out: it short-circuits `isSubagentSession()`, restoring the
+pre-warm, all seven scans and the auxiliary fleet for a Gentle Shell child too.
+`tests/clients/dispatch/auxiliary-lsp.test.ts` carries the runtime witness for
+both directions, and `tests/clients/subagent-mode.test.ts` pins detection,
+non-`"1"` values, the marker name, the override and the precedence of the two
+older vocabularies when this marker is also set.
+
 ## The three env levers
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected subagent child session — nicobailon/pi-subagents (`PI_SUBAGENT_CHILD=1`) or avtc-pi-subagent (`PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, #507) — disables the light-mode heavyweight-scan skip for either vocabulary. |
+| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected subagent child session — nicobailon/pi-subagents (`PI_SUBAGENT_CHILD=1`), avtc-pi-subagent (`PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, #507) or Gentle Shell (`GENTLE_PI_AGENTS_CHILD=1`) — disables the light-mode heavyweight-scan skip for every vocabulary. |
 | `PI_LENS_CONCURRENT_SESSION_GUARD` | unset (guard enabled) | Set to `0` to disable the #473 concurrent-session guard entirely — every `session_start` classifies as sequential replacement (pre-#473 behavior: a concurrent in-process bind would run the full reset, tearing down the parent's live LSP fleet). |
 | `PI_LENS_INSTANCE_REGISTRY` | unset (registry enabled) | Set to `0` to disable the #474 cross-process instance registry — no orphan-LSP reaping happens at `session_start`, but also no new risk (registry writes are best-effort and already fail open). |
 
@@ -320,10 +352,10 @@ with its OWN env vocabulary**: sets `PI_SUBAGENT_CHILD_AGENT` +
 subagent signal, alongside nicobailon's `PI_SUBAGENT_CHILD=1`. The pair is
 required rather than either var alone — a lone var set by some unrelated
 tool must not trigger light mode by itself. `PI_LENS_SUBAGENT_FULL=1` remains
-the universal opt-out for both vocabularies. `getSubagentIdentity()` now also
-reports which vocabulary matched (`marker: "pi-subagents" | "avtc-pi-subagent"`),
-surfaced in the `subagent_light_mode` latency phase so dogfooding can tell the
-ecosystems apart. Its per-feature worktree isolation is the same bystander
+the universal opt-out for every vocabulary. `getSubagentIdentity()` now also
+reports which vocabulary matched (`marker: "pi-subagents" | "avtc-pi-subagent" |
+"gentle-shell"`), surfaced in the `subagent_light_mode` latency phase so
+dogfooding can tell the ecosystems apart. Its per-feature worktree isolation is the same bystander
 situation as pi-dynamic-workflows' isolated worktrees — no separate row
 needed for that.
 

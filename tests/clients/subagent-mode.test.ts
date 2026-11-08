@@ -1,10 +1,11 @@
 /**
  * Subagent light mode (#449 slice 0; broadened #507).
  *
- * Covers: env detection of `PI_SUBAGENT_CHILD=1` (nicobailon/pi-subagents)
- * and the `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair
- * (avtc-pi-subagent, #507), the `PI_LENS_SUBAGENT_FULL=1` override hatch for
- * both vocabularies, and identity parsing (including the `marker` field).
+ * Covers: env detection of `PI_SUBAGENT_CHILD=1` (nicobailon/pi-subagents),
+ * the `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair
+ * (avtc-pi-subagent, #507) and `GENTLE_PI_AGENTS_CHILD=1` (Gentle Shell), the
+ * `PI_LENS_SUBAGENT_FULL=1` override hatch for every vocabulary, and identity
+ * parsing (including the `marker` field).
  * `_resetSubagentModeForTests` is exercised by the hooks below, not by a case.
  */
 
@@ -17,6 +18,7 @@ import {
 } from "../../clients/subagent-mode.js";
 
 const envKeys = [
+	"GENTLE_PI_AGENTS_CHILD",
 	"PI_SUBAGENT_CHILD",
 	"PI_LENS_SUBAGENT_FULL",
 	"PI_SUBAGENT_RUN_ID",
@@ -43,6 +45,30 @@ afterEach(() => {
 });
 
 describe("isSubagentSession", () => {
+	// Gentle Shell children set this marker, not PI_SUBAGENT_CHILD.
+	it("detects a Gentle Shell child without other markers", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		expect(isSubagentSession()).toBe(true);
+		expect(getSubagentIdentity()?.marker).toBe("gentle-shell");
+	});
+
+	it("does not detect non-1 Gentle Shell marker values", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "true";
+		expect(isSubagentSession()).toBe(false);
+	});
+
+	it("allows full mode to override a Gentle Shell child", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		process.env.PI_LENS_SUBAGENT_FULL = "1";
+		expect(isSubagentSession()).toBe(false);
+	});
+
+	it("keeps the existing vocabularies' precedence when the Gentle marker is also set", () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		process.env.PI_SUBAGENT_CHILD = "1";
+		expect(getSubagentIdentity()?.marker).toBe("pi-subagents");
+	});
+
 	it("is false when PI_SUBAGENT_CHILD is unset", () => {
 		expect(isSubagentSession()).toBe(false);
 	});
