@@ -7,10 +7,15 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
-import type { InstanceEntry } from "../../clients/instance-registry.js";
+import {
+	type InstanceEntry,
+	readInstanceRegistry,
+	registerInstance,
+} from "../../clients/instance-registry.js";
 import {
 	boundUnixSocketPath,
 	diagnosticsIpcPathForCwd,
+	WARM_DIAGNOSTICS_SCHEMA_VERSION,
 } from "../../clients/mcp/ipc.js";
 import { STALE_HEARTBEAT_MS } from "../../clients/instance-reaper.js";
 import { normalizeFilePath } from "../../clients/path-utils.js";
@@ -33,6 +38,14 @@ import {
 	removeTempDirSync,
 	setupTestEnvironment,
 } from "./test-utils.js";
+
+function closeServer(server: net.Server | undefined): void {
+	if (!server) return;
+	(
+		server as net.Server & { closeAllConnections?: () => void }
+	).closeAllConnections?.();
+	server.close();
+}
 
 function entry(pid: number, root: string, heartbeatAt: string): InstanceEntry {
 	return {
@@ -323,6 +336,203 @@ describe.skipIf(process.platform === "win32")(
 				expect(fs.readFileSync(bound, "utf8")).toBe("user data");
 				expect(await connectOutcome(endpoint)).not.toBe("connected");
 			});
+		});
+	},
+);
+
+// Gentle Shell gives every child `pi` its own TMPDIR (`mkdtemp` under the
+// inherited one, `lib/agents-runner.ts`), while the diagnostics endpoint used to
+// be re-derived by the READER from its own `os.tmpdir()`. The child therefore
+// computed a name under its own tmp root, reached nothing, and fell back to a
+// local fleet. Each session now publishes the endpoint it BOUND in its
+// instance-registry entry, and an attaching session connects to that.
+describe.skipIf(process.platform === "win32")(
+	"warm attach follows the incumbent's published endpoint",
+	() => {
+		/** This process's parent: a real live pid that is never `process.pid`. */
+		const PEER_PID = process.ppid;
+		const savedHome = process.env.PI_LENS_HOME;
+		let tmpDir: string;
+		let home: string;
+		let root: string;
+		/** The child's own tmp root: short enough for a socket name to fit. */
+		let childTmp: string;
+		let peer: net.Server | undefined;
+
+		beforeEach(() => {
+			tmpDir = setupTestEnvironment("pi-lens-wa-pub-").tmpDir;
+			home = path.join(tmpDir, "home");
+			root = path.join(tmpDir, "ws");
+			fs.mkdirSync(home, { recursive: true });
+			fs.mkdirSync(root, { recursive: true });
+			childTmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-c-"));
+			process.env.PI_LENS_HOME = home;
+			vi.stubEnv("PI_LENS_WARM_ATTACH", "1");
+			resetDegradationLedger();
+		});
+
+		afterEach(() => {
+			_resetWarmAttachForTests();
+			closeServer(peer);
+			peer = undefined;
+			resetDegradationLedger();
+			vi.unstubAllEnvs();
+			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = savedHome;
+			removeTempDirSync(childTmp);
+		});
+
+		/** The name the incumbent BOUND, spelled as production publishes it. */
+		function boundPeerEndpoint(): string {
+			return boundUnixSocketPath(diagnosticsIpcPathForCwd(root, PEER_PID));
+		}
+
+		function writePeerEntry(diagnosticsEndpoint: string | undefined): void {
+			fs.writeFileSync(
+				path.join(home, "instances.json"),
+				JSON.stringify({
+					instances: [
+						{
+							...entry(PEER_PID, root, new Date().toISOString()),
+							...(diagnosticsEndpoint === undefined
+								? {}
+								: { diagnosticsEndpoint }),
+						},
+					],
+				}),
+			);
+		}
+
+		/** A peer that answers one diagnostics request over the wire. */
+		async function startPeer(endpoint: string): Promise<net.Server> {
+			const server = net.createServer((socket) => {
+				socket.setEncoding("utf8");
+				let buffered = "";
+				socket.on("data", (chunk: string) => {
+					buffered += chunk;
+					const newline = buffered.indexOf("\n");
+					if (newline === -1) return;
+					const request = JSON.parse(buffered.slice(0, newline)) as {
+						contentHash: string;
+					};
+					socket.end(
+						`${JSON.stringify({
+							result: {
+								route: "diagnostics",
+								version: WARM_DIAGNOSTICS_SCHEMA_VERSION,
+								diagnostics: [],
+								contentHash: request.contentHash,
+								servedAt: Date.now(),
+								fresh: true,
+								inconclusive: false,
+								binding: { boundToCurrentDisk: "unknown" },
+							},
+						})}\n`,
+					);
+				});
+			});
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(endpoint, resolve);
+			});
+			return server;
+		}
+
+		it("attaches over the published endpoint when the two sessions use different TMPDIRs", async () => {
+			const published = boundPeerEndpoint();
+			peer = await startPeer(published);
+			vi.stubEnv("TMPDIR", childTmp);
+			expect(diagnosticsIpcPathForCwd(root, PEER_PID)).not.toBe(published);
+			writePeerEntry(published);
+
+			await configureWarmAttach(root);
+			expect(warmAttachAttachment()).toEqual({ root, incumbentPid: PEER_PID });
+			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 1_000);
+			expect(result?.available, JSON.stringify(result)).toBe(true);
+			expect(isWarmAttached()).toBe(true);
+		});
+
+		it("attaches a Gentle Shell child to the parent's fleet when its TMPDIR is its own directory", async () => {
+			const inheritedTmp = os.tmpdir();
+			const published = boundPeerEndpoint();
+			peer = await startPeer(published);
+			// What Gentle Shell's runner does: one `mkdtemp` per child, UNDER the
+			// inherited root, so the child's `os.tmpdir()` is not the parent's.
+			vi.stubEnv("TMPDIR", childTmp);
+			expect(path.dirname(childTmp)).toBe(inheritedTmp);
+			expect(diagnosticsIpcPathForCwd(root, PEER_PID)).not.toBe(published);
+			writePeerEntry(published);
+
+			await configureWarmAttach(root);
+			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 1_000);
+			expect(result?.available, JSON.stringify(result)).toBe(true);
+			expect(warmAttachAttachment()?.incumbentPid).toBe(PEER_PID);
+		});
+
+		it("keeps deriving the endpoint for a peer that publishes nothing", async () => {
+			const derived = diagnosticsIpcPathForCwd(root, PEER_PID);
+			peer = await startPeer(derived);
+			writePeerEntry(undefined);
+
+			await configureWarmAttach(root);
+			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 1_000);
+			expect(result?.available, JSON.stringify(result)).toBe(true);
+			expect(isWarmAttached()).toBe(true);
+		});
+
+		it("ends local instead of attaching across TMPDIRs when the peer publishes nothing", async () => {
+			vi.stubEnv("TMPDIR", childTmp);
+			writePeerEntry(undefined);
+
+			await configureWarmAttach(root);
+			// Today's behavior for an older peer: it is still selected, and the
+			// first request that reaches nothing promotes the session to local.
+			expect(isWarmAttached()).toBe(true);
+			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 500);
+			expect(result).toEqual({ available: false, reason: "no-listener" });
+			expect(isWarmAttached(), "the child runs its own fleet").toBe(false);
+		});
+
+		it("promotes to local instead of hanging when the published endpoint no longer listens", async () => {
+			writePeerEntry(
+				path.join(
+					tmpDir,
+					"gone",
+					"pi-lens-mcp-99-diagnostics-0123456789abcdef.sock",
+				),
+			);
+
+			await configureWarmAttach(root);
+			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 5_000);
+			expect(result).toEqual({ available: false, reason: "no-listener" });
+			expect(isWarmAttached()).toBe(false);
+		});
+
+		it("publishes the name it bound, and registers only after reading peers", async () => {
+			const published = boundPeerEndpoint();
+			peer = await startPeer(published);
+			writePeerEntry(published);
+
+			await configureWarmAttach(root);
+			expect(warmAttachAttachment()?.incumbentPid).toBe(PEER_PID);
+			// Reading peers happens BEFORE this session writes its own entry.
+			expect(
+				(await readInstanceRegistry()).some(
+					(candidate) => candidate.pid === process.pid,
+				),
+			).toBe(false);
+
+			await registerInstance(root);
+			const own = (await readInstanceRegistry()).find(
+				(candidate) => candidate.pid === process.pid,
+			);
+			expect(own?.diagnosticsEndpoint).toBe(
+				boundUnixSocketPath(diagnosticsIpcPathForCwd(root, process.pid)),
+			);
+			// The published name is the one this process really listens on.
+			expect(await connectOutcome(own?.diagnosticsEndpoint ?? "")).toBe(
+				"connected",
+			);
 		});
 	},
 );

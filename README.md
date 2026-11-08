@@ -29,6 +29,12 @@ cost in every child:
   or once the incumbent goes away, the session enables its fleet and stays enabled. When the peer
   check cannot answer, the fleet is enabled: the failure direction costs memory instead of dropping
   findings.
+- Warm attach (`PI_LENS_WARM_ATTACH=1`) now works between a Gentle Shell child and its parent even
+  though Gentle Shell gives every child its own temporary directory. Each session records the
+  diagnostics socket it actually listens on, and an attaching session connects to that recorded
+  path instead of deriving one from its own tmp root. A peer that records nothing keeps the
+  previous derivation, so an older pi-lens degrades to today's behavior instead of dialing a
+  wrong path, and a recorded path that no longer answers falls back to the local fleet as before.
 - The shared test setup deletes the whole subagent vocabulary from the worker environment,
   so a suite running inside a subagent child no longer turns ordinary cases into light-mode
   cases.

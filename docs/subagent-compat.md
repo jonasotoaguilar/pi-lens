@@ -147,6 +147,41 @@ so the child's root is normally uncovered and the child runs its own fleet.
 A child started in the PARENT's worktree root IS covered by the parent, but it
 also has to be warm-attached to the parent's fleet to skip, which is what the
 original behavior silently assumed.
+
+### The published endpoint: why a child with its own TMPDIR can attach
+
+Warm attach is only half of premise 2 above. The diagnostics endpoint is a Unix
+socket under `os.tmpdir()` (a `\\.\pipe\` name on Windows, where no temporary
+directory enters the name), and Gentle Shell's agent runner gives every child
+its own temporary directory — `mkdtemp` under the inherited one
+(`lib/agents-runner.ts`). Deriving the endpoint in the READER therefore made a
+Gentle Shell child compute a name under its own tmp root: it never reached the
+parent's listener, promoted to local on its first request, and ran its own
+fleet — the exact cost the second premise then refused to skip.
+
+Each session now PUBLISHES the endpoint it bound in its own registry entry
+(`diagnosticsEndpoint`, stamped by `registerInstance`/`recordLspChild` from the
+value `clients/warm-attach.ts` publishes at bind time), and an attaching session
+connects to the incumbent's published value instead of re-deriving it. The
+published string is the name the OS accepted, so the `sun_path` cut happens once,
+at bind time (`boundUnixSocketPath`), and no reader re-cuts or re-spells it.
+Ordering is the one `index.ts` already had: `configureWarmAttach` is awaited
+(bind, publish, then read peers) and `registerInstance` runs after it, so a
+session reads its peers before it publishes itself.
+
+Backward compatibility is one-directional by construction. The field is
+optional: an entry written by an older pi-lens parses unchanged and still
+selects as a live peer (`selectLivePeerInstances` reads no new field), and a
+peer that publishes nothing keeps the derived name — the previous behavior,
+which still works when both sessions share a tmp root. A published path that no
+longer listens is not a hang: the connect fails `ENOENT`/`ECONNREFUSED`, which
+is the existing `no-listener` failure, and the session promotes to its local
+fleet exactly as any other unreachable incumbent does.
+`tests/clients/warm-attach.test.ts` drives two different TMPDIRs over real
+sockets (the Gentle Shell shape included), `tests/clients/ipc-path.test.ts` pins
+the published-over-derived rule and the single cut, and
+`tests/clients/instance-registry.test.ts` pins the record and its
+back-compatibility.
 `tests/clients/dispatch/auxiliary-lsp-peer-coverage.test.ts` carries the
 coverage matrix (covered, no peer, different root, containing root, dead pid,
 unreadable registry, guessed root, second root, no attachment, attachment for

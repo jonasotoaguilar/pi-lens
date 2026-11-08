@@ -1180,4 +1180,79 @@ describe("instance-registry", () => {
 			).toEqual([]);
 		});
 	});
+
+	// The endpoint a session BOUND for warm attach, published in its own entry.
+	// Without it a peer whose `os.tmpdir()` differs — every Gentle Shell child,
+	// whose runner gives each child `mkdtemp` under the inherited root — re-derived
+	// a name nobody bound and fell back to a local fleet.
+	describe("published warm-attach endpoint", () => {
+		const ENDPOINT =
+			"/tmp/pi-lens-parent/pi-lens-mcp-7-diagnostics-0123456789abcdef.sock";
+
+		it("records the endpoint this process bound, and keeps it across a heartbeat", async () => {
+			const {
+				publishDiagnosticsEndpoint,
+				registerInstance,
+				updateHeartbeat,
+				readInstanceRegistry,
+			} = await import("../../clients/instance-registry.js");
+			publishDiagnosticsEndpoint(ENDPOINT);
+			try {
+				await registerInstance("/some/project");
+				await updateHeartbeat();
+
+				const [own] = await readInstanceRegistry();
+				expect(own?.diagnosticsEndpoint).toBe(ENDPOINT);
+				const parsed = JSON.parse(
+					fs.readFileSync(path.join(dir, "instances.json"), "utf-8"),
+				);
+				expect(parsed.instances[0].diagnosticsEndpoint).toBe(ENDPOINT);
+			} finally {
+				publishDiagnosticsEndpoint(undefined);
+			}
+		});
+
+		it("publishes no field at all when this process bound nothing", async () => {
+			const { registerInstance } =
+				await import("../../clients/instance-registry.js");
+			await registerInstance("/some/project");
+
+			const parsed = JSON.parse(
+				fs.readFileSync(path.join(dir, "instances.json"), "utf-8"),
+			);
+			expect(parsed.instances[0]).not.toHaveProperty("diagnosticsEndpoint");
+		});
+
+		it("reads an entry written before the field existed, and still counts it as a live peer", async () => {
+			const now = new Date().toISOString();
+			fs.writeFileSync(
+				path.join(dir, "instances.json"),
+				JSON.stringify({
+					instances: [
+						{
+							pid: process.ppid,
+							startedAt: now,
+							projectRoot: "/old",
+							lspChildren: [],
+							lspChildCount: 0,
+							rssBytes: 1,
+							heartbeatAt: now,
+						},
+					],
+				}),
+				"utf-8",
+			);
+			const { readInstanceRegistry, selectLivePeerInstances } =
+				await import("../../clients/instance-registry.js");
+
+			const entries = await readInstanceRegistry();
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).not.toHaveProperty("diagnosticsEndpoint");
+			expect(
+				selectLivePeerInstances(entries, "/old", Date.now(), () => true).map(
+					(entry) => entry.pid,
+				),
+			).toEqual([process.ppid]);
+		});
+	});
 });
