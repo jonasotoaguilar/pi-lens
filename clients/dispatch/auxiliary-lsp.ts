@@ -20,6 +20,18 @@
 import type { LSPDiagnostic } from "../lsp/client.js";
 import { lineTextAt } from "../lsp/content-scan.js";
 import { shouldDegradeAuxiliaryLsp } from "../lsp-budget.js";
+import {
+	getAuthoritativeInstanceRoots,
+	type InstanceEntry,
+	readInstanceRegistry,
+	selectLivePeerInstances,
+} from "../instance-registry.js";
+import {
+	claimPhaseOncePerSession,
+	logLatency,
+	releaseOncePerSessionPhase,
+} from "../latency-logger.js";
+import { realIsPidAlive } from "../pid-liveness.js";
 import { isSubagentSession } from "../subagent-mode.js";
 import type { FileRole } from "../file-role.js";
 import { findLocalOpengrepConfig } from "../opengrep-config.js";
@@ -286,6 +298,137 @@ export function isOptInAuxiliaryServerId(serverId: string): boolean {
 
 export type GetFlag = (flag: string) => boolean | string | undefined;
 
+/**
+ * #713 corrected: whether a live peer instance ALREADY runs the auxiliary
+ * fleet over this session's own project root. See
+ * {@link refreshSubagentAuxiliaryPeerCoverage} for the probe and
+ * {@link enabledAuxiliaryLspServerIds} for the gate that reads this.
+ */
+const PEER_COVERAGE_PHASE = "subagent_auxiliary_peer_coverage";
+
+/**
+ * One session-boundary answer, cached for the dispatch gate the same way the
+ * LSP budget degrade caches its decision (`clients/lsp-budget.ts`). Absent
+ * means "not asked yet", which reads as NOT covered: every unknown fails
+ * toward ENABLING the fleet, never toward a silently empty scan.
+ */
+let peerCoverage: { root: string; covered: boolean } | undefined;
+
+/** True only when a same-root live peer was confirmed for this session. */
+export function subagentAuxiliaryFleetDeferredToPeer(): boolean {
+	return peerCoverage?.covered === true;
+}
+
+/** Test-only: re-arm the session-scoped decision and its once-per-session
+ *  record claim, matching the `_reset…ForTests` convention. */
+export function _resetSubagentAuxiliaryPeerCoverageForTests(): void {
+	peerCoverage = undefined;
+	releaseOncePerSessionPhase(PEER_COVERAGE_PHASE);
+}
+
+export interface SubagentPeerCoverageProbe {
+	/** This session's own project root — the one `registerInstance` records for
+	 *  it, so a peer answer is comparable to this session's own registration. */
+	root: string;
+	/** A pre-read registry snapshot, for callers (and tests) that already hold
+	 *  one. Omitted => the one registry read this probe performs. */
+	entries?: readonly InstanceEntry[];
+	now?: number;
+	isPidAlive?: (pid: number) => boolean;
+	/** Checked after the registry read and before the decision is published: a
+	 *  session superseded while the read was in flight publishes nothing, so a
+	 *  late answer cannot decide another session's fleet (catalog shape 22). */
+	isCurrent?: () => boolean;
+}
+
+/**
+ * The registry entries a peer's fleet can be trusted to serve: the roots each
+ * one AUTHORITATIVELY holds, through the registry's own
+ * {@link getAuthoritativeInstanceRoots} — which drops the index-0
+ * `process.cwd()` a `rootSource: "lsp-fallback"` entry guessed before its
+ * real registration (#2130). That rule belongs to the module holding the
+ * field, not here; this loop only projects the answer into the shape the peer
+ * comparator reads.
+ */
+function authoritativeRootEntries(
+	entries: readonly InstanceEntry[],
+): InstanceEntry[] {
+	const candidates: InstanceEntry[] = [];
+	for (const entry of entries) {
+		const roots = getAuthoritativeInstanceRoots(entry);
+		if (roots.length === 0) continue;
+		candidates.push({ ...entry, projectRoots: roots });
+	}
+	return candidates;
+}
+
+/**
+ * Session-boundary probe: does a LIVE peer serve this session's own project
+ * root? `clients/lsp-budget.ts`'s degrade decision answers the same shape for
+ * the machine-wide budget; this one answers for the subagent auxiliary skip.
+ *
+ * The skip it feeds assumed the parent session runs those servers on the same
+ * cwd. That holds for an in-place fan-out and fails for both delegated
+ * launches Gentle Shell performs — a child `pi` started in another worktree of
+ * the clone (`workspace_root`), or in an independent repository
+ * (`repository_root`) — because no environment variable carries location
+ * identity. A child there inherited a skip whose premise was false and lost
+ * opengrep/ast-grep/typos/zizmor coverage of a tree no peer scanned.
+ *
+ * Awaitable but never required to be awaited by the host — the caller
+ * (`clients/runtime-session.ts`) fires it, because a registry read must not
+ * delay `session_start`. Dispatch happens later in the turn, so the cache is
+ * populated before its first read in practice; a turn that beats the read
+ * enables the fleet, the safe direction.
+ *
+ * Never throws: an unreadable registry, a torn snapshot or a throwing
+ * comparator leaves the answer at NOT covered (enable).
+ */
+export async function refreshSubagentAuxiliaryPeerCoverage(
+	probe: SubagentPeerCoverageProbe,
+): Promise<boolean> {
+	if (!isSubagentSession()) {
+		// Nothing to defer: a primary session always runs its own fleet, and
+		// `PI_LENS_SUBAGENT_FULL=1` lands here too.
+		peerCoverage = undefined;
+		return false;
+	}
+	try {
+		const entries = probe.entries ?? (await readInstanceRegistry());
+		if (probe.isCurrent !== undefined && !probe.isCurrent()) return false;
+		const peers = selectLivePeerInstances(
+			authoritativeRootEntries(entries),
+			probe.root,
+			probe.now,
+			probe.isPidAlive ?? realIsPidAlive,
+			"exact",
+		);
+		const covered = peers.length > 0;
+		peerCoverage = { root: probe.root, covered };
+		// One row per session root, claimed before the payload is built: a
+		// re-fired session start for the same root cannot add a second row.
+		if (claimPhaseOncePerSession(PEER_COVERAGE_PHASE, probe.root)) {
+			logLatency({
+				type: "phase",
+				phase: "subagent_auxiliary_peer_coverage",
+				filePath: probe.root,
+				durationMs: 0,
+				metadata: {
+					peerCovered: covered,
+					peerCount: peers.length,
+					registryEntries: entries.length,
+				},
+			});
+		}
+		return covered;
+	} catch {
+		// Best-effort, like every other registry consumer: an unanswered coverage
+		// question must never read as covered.
+		peerCoverage = { root: probe.root, covered: false };
+		return false;
+	}
+}
+
 /** The auxiliary server ids enabled for this turn (the lsp runner passes these
  *  to `touchFile` since it — not the LSP service — owns flag access).
  *
@@ -297,11 +440,14 @@ export type GetFlag = (flag: string) => boolean | string | undefined;
  * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
 	// #449 slice 2 (budget): skip auxiliaries when machine-wide LSP budget is
-	// exceeded. #713 (subagent light mode): reuse the same seam — a subagent
-	// session also skips auxiliaries; the parent session already runs them on
-	// the same cwd. PI_LENS_SUBAGENT_FULL=1 restores full behavior via
+	// exceeded. #713 (subagent light mode): reuse the same seam, but only under
+	// REAL peer coverage of this session's own root
+	// (`refreshSubagentAuxiliaryPeerCoverage`) — a delegated child in another
+	// worktree or repository has no peer scanning its tree, so it runs the fleet
+	// itself. PI_LENS_SUBAGENT_FULL=1 still restores full behavior via
 	// isSubagentSession() returning false.
-	if (shouldDegradeAuxiliaryLsp() || isSubagentSession()) return [];
+	if (shouldDegradeAuxiliaryLsp()) return [];
+	if (isSubagentSession() && subagentAuxiliaryFleetDeferredToPeer()) return [];
 	return AUXILIARY_LSP_PROFILES.flatMap((p) =>
 		isEnabledByConfiguration(p, getFlag) ? [p.serverId] : [],
 	);

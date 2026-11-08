@@ -283,6 +283,44 @@ function notifyStartupWarmSkip(args: {
 	);
 }
 
+/**
+ * #713 corrected: decide, at the session boundary, whether this subagent's own
+ * project root is already served by a live peer's auxiliary LSP fleet.
+ *
+ * The auxiliary gate (`clients/dispatch/auxiliary-lsp.ts`) reads the answer
+ * synchronously on every dispatch, so the registry read has to happen here —
+ * the same split the machine-wide LSP budget degrade uses. Nothing is awaited:
+ * a registry read must not delay `session_start`, and a dispatch that beats the
+ * read enables the fleet, which is the safe direction. The module is imported
+ * lazily for the same reason `clients/dispatch/fact-store.js` is: only a
+ * subagent session pays for loading it.
+ */
+function probeSubagentAuxiliaryPeerCoverage(args: {
+	root: string;
+	runtime: RuntimeCoordinator;
+	sessionGeneration: number;
+	dbg: SessionStartDeps["dbg"];
+}): void {
+	void import("./dispatch/auxiliary-lsp.js")
+		.then(({ refreshSubagentAuxiliaryPeerCoverage }) =>
+			refreshSubagentAuxiliaryPeerCoverage({
+				root: args.root,
+				isCurrent: () => args.runtime.isCurrentSession(args.sessionGeneration),
+			}),
+		)
+		.then((covered) => {
+			if (!args.runtime.isCurrentSession(args.sessionGeneration)) return;
+			args.dbg(
+				covered
+					? `session_start subagent auxiliaries: deferred to a live peer on ${args.root}`
+					: `session_start subagent auxiliaries: enabled, no live peer covers ${args.root}`,
+			);
+		})
+		.catch(() => {
+			// best-effort peer probe — never fail session_start over this
+		});
+}
+
 /** `SessionStartDeps` with the analyzer clients merged in. */
 type BootstrapResolvedDeps = SessionStartDeps & BootstrapClients;
 
@@ -1677,7 +1715,7 @@ function scheduleStartupScansWithClients(
 	// external CLI that walks the whole project tree on its own — a walk we
 	// don't control or get to route to an async collector. On a measured-slow
 	// filesystem that walk reproduces the exact multi-second freeze this
-	// feature exists to prevent, so skip exactly those seven with a visible
+	// feature exists to prevent, so skip exactly those eight with a visible
 	// reason instead of leaving the agent to read an empty/stale cache as
 	// "clean". The other scans in this function (todo above; call-graph/
 	// codebase-model/ast-grep-exports/word-index below) walk via
@@ -3028,6 +3066,26 @@ export async function handleSessionStart(
 	void sweepDeadEphemeralDataDirs({ isPidAlive: realIsPidAlive }).catch(() => {
 		// best-effort lifecycle cleanup — never fail session_start
 	});
+	// #713 corrected: light mode's auxiliary skip is only sound when a live peer
+	// already runs that fleet over THIS session's own root, so the skip is
+	// decided here — at the session boundary, like the machine-wide LSP budget
+	// degrade — and the synchronous dispatch gate reads the cached answer. A
+	// delegated child in another worktree or repository has no such peer and
+	// keeps its own fleet.
+	//
+	// Placed BEFORE the quick-mode return on purpose: the gate is consulted on
+	// every dispatch whatever the startup mode, and a fresh child `pi`'s FIRST
+	// session is quick — exactly the short-lived agent this skip exists for. A
+	// probe that only ran on the full path would leave quick mode with no
+	// answer, which fails toward enabling the fleet in every covered child.
+	if (isSubagentSession()) {
+		probeSubagentAuxiliaryPeerCoverage({
+			root: cwd,
+			runtime,
+			sessionGeneration: runtime.sessionGeneration,
+			dbg,
+		});
+	}
 	if (quickMode) {
 		runtime.projectRoot = cwd;
 		const snapshotRoot = resolveSnapshotRoot(cwd);

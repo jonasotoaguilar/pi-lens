@@ -60,29 +60,41 @@ describe("auxiliary LSP enablement", () => {
 		);
 	});
 
-	// #713: subagent light mode skips all auxiliary servers (same seam as budget
-	// degrade) — parent session already runs them on the same cwd.
-	it("subagent session returns empty auxiliary set (#713)", () => {
+	// #713 + the peer-coverage premise: light mode skips the auxiliary fleet
+	// only while a live peer instance serves THIS session's own project root —
+	// the same-cwd parent the skip was written for. With no peer covering the
+	// root the fleet must run here, or a delegated child (a different worktree,
+	// an independent repository) loses opengrep/ast-grep/typos/zizmor coverage
+	// of a tree nothing else scans.
+	it("a subagent session with no peer on its root keeps the auxiliary fleet", () => {
 		process.env.PI_SUBAGENT_CHILD = "1";
 		_resetSubagentModeForTests();
 		try {
-			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
+				"opengrep",
+				"ast-grep",
+				"zizmor",
+				"typos",
+			]);
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD;
 			_resetSubagentModeForTests();
 		}
 	});
 
-	it("subagent session skips auxiliaries regardless of kill-switch flags (#713)", () => {
+	it("a subagent session with no peer on its root is gated exactly like a primary session", () => {
 		process.env.PI_SUBAGENT_CHILD = "1";
 		_resetSubagentModeForTests();
 		try {
-			// Even with no kill switches active, the subagent seam returns empty
-			const ids = enabledAuxiliaryLspServerIds(() => undefined);
-			expect(ids).not.toContain("opengrep");
-			expect(ids).not.toContain("zizmor");
-			expect(ids).not.toContain("typos");
-			expect(ids).toEqual([]);
+			const primary = enabledAuxiliaryLspServerIds(
+				(flag) => flag === "no-zizmor",
+			);
+			delete process.env.PI_SUBAGENT_CHILD;
+			_resetSubagentModeForTests();
+			expect(
+				enabledAuxiliaryLspServerIds((flag) => flag === "no-zizmor"),
+			).toEqual(primary);
+			expect(primary).toEqual(["opengrep", "ast-grep", "typos"]);
 		} finally {
 			delete process.env.PI_SUBAGENT_CHILD;
 			_resetSubagentModeForTests();
@@ -112,11 +124,16 @@ describe("auxiliary LSP enablement", () => {
 	// every test file (a Gentle Shell child lane inherits
 	// `GENTLE_PI_AGENTS_CHILD=1`, which turned the three default-on cases above
 	// into light-mode cases: 3 red there, 0 with the marker unset).
-	it("Gentle Shell child returns empty auxiliary set (#713 vocabulary)", () => {
+	it("a Gentle Shell child with no peer on its root keeps the auxiliary fleet (#713 vocabulary)", () => {
 		process.env.GENTLE_PI_AGENTS_CHILD = "1";
 		_resetSubagentModeForTests();
 		try {
-			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
+				"opengrep",
+				"ast-grep",
+				"zizmor",
+				"typos",
+			]);
 		} finally {
 			delete process.env.GENTLE_PI_AGENTS_CHILD;
 			_resetSubagentModeForTests();
@@ -181,7 +198,6 @@ describe("configDisabledAuxiliaryLspServerIds (#4323)", () => {
 		process.env.PI_SUBAGENT_CHILD = "1";
 		_resetSubagentModeForTests();
 		try {
-			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
 			expect([...configDisabledAuxiliaryLspServerIds(() => undefined)]).toEqual(
 				[],
 			);

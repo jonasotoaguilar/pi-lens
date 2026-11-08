@@ -15,6 +15,7 @@ import {
 	removeTempDirSync,
 	restorePinnedFixtureHomes,
 } from "../clients/test-utils.js";
+import { SUBAGENT_VOCABULARY_KEYS as OWNER_SUBAGENT_VOCABULARY_KEYS } from "../../clients/subagent-mode.js";
 import {
 	formatTmpRootCreators,
 	formatTmpRootSweep,
@@ -762,18 +763,16 @@ installGitFixtureEnv(tmpHygieneHome);
 // A case that wants a subagent posture sets its marker itself
 // (`tests/clients/subagent-mode.test.ts`, the auxiliary-LSP gate cases).
 //
+// The list is the OWNER's (`clients/subagent-mode.ts`), imported rather than
+// re-spelled: a vocabulary added there is deleted here without another edit.
+// `tests/support/vitest-setup-subagent-vocabulary.test.ts` asserts this loop
+// actually ran in the worker, and that the list is that module's own array.
+//
 // Never restored, like the pins above: putting an inherited marker back would
 // re-arm exactly the light mode every case here exists to keep out of its own
 // run. `PI_LENS_SUBAGENT_FULL` is in the list for the same reason — a lane that
 // exports it must not decide for a case whether full or light behavior runs.
-const SUBAGENT_VOCABULARY_KEYS = [
-	"GENTLE_PI_AGENTS_CHILD",
-	"PI_SUBAGENT_CHILD",
-	"PI_SUBAGENT_CHILD_AGENT",
-	"PI_SUBAGENT_PARENT_PID",
-	"PI_SUBAGENT_RUN_ID",
-	"PI_LENS_SUBAGENT_FULL",
-] as const;
+export const SUBAGENT_VOCABULARY_KEYS = OWNER_SUBAGENT_VOCABULARY_KEYS;
 for (const key of SUBAGENT_VOCABULARY_KEYS) delete process.env[key];
 
 // #3083: session_start reaches the backstop transitively through index.js.

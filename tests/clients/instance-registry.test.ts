@@ -13,6 +13,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { suspendAt } from "./interleaving-kit.js";
 import { removeTempDirSync } from "./test-utils.js";
+import type { InstanceEntry } from "../../clients/instance-registry.js";
 
 let dir: string;
 let previousHome: string | undefined;
@@ -1090,6 +1091,93 @@ describe("instance-registry", () => {
 			mod._resetInstanceRegistryEnabledForTests();
 			await mod.registerInstance("/proj");
 			expect(fs.existsSync(registryFilePath())).toBe(true);
+		});
+	});
+
+	// `rootSource` is this module's field, so "which of these roots is evidence
+	// of where the host works" is this module's rule. A consumer (the subagent
+	// auxiliary peer-coverage probe) asks this accessor instead of re-deriving
+	// the rule beside its own gate, where a change to the field's meaning would
+	// leave two answers.
+	describe("getAuthoritativeInstanceRoots (the owner of root provenance)", () => {
+		const entry = (over: Partial<InstanceEntry> = {}): InstanceEntry => ({
+			pid: 4242,
+			startedAt: new Date(0).toISOString(),
+			projectRoot: "/real/root",
+			projectRoots: ["/real/root"],
+			lspChildren: [],
+			lspChildCount: 0,
+			rssBytes: 0,
+			heartbeatAt: new Date(0).toISOString(),
+			...over,
+		});
+
+		it("drops the synthesized index-0 root of an lsp-fallback entry", async () => {
+			const { getAuthoritativeInstanceRoots } =
+				await import("../../clients/instance-registry.js");
+
+			expect(
+				getAuthoritativeInstanceRoots(
+					entry({
+						rootSource: "lsp-fallback",
+						projectRoot: "/guessed",
+						projectRoots: ["/guessed"],
+					}),
+				),
+			).toEqual([]);
+		});
+
+		it("keeps roots appended after an lsp-fallback guess", async () => {
+			const { getAuthoritativeInstanceRoots } =
+				await import("../../clients/instance-registry.js");
+
+			expect(
+				getAuthoritativeInstanceRoots(
+					entry({
+						rootSource: "lsp-fallback",
+						projectRoot: "/guessed",
+						projectRoots: ["/guessed", "/real"],
+					}),
+				),
+			).toEqual(["/real"]);
+		});
+
+		it("keeps every root of a real registration", async () => {
+			const { getAuthoritativeInstanceRoots } =
+				await import("../../clients/instance-registry.js");
+			const roots = ["/first", "/second"];
+
+			for (const rootSource of [
+				"session-cwd",
+				"service-cwd",
+				undefined,
+			] as const) {
+				expect(
+					getAuthoritativeInstanceRoots(
+						entry({ rootSource, projectRoot: "/first", projectRoots: roots }),
+					),
+				).toEqual(roots);
+			}
+		});
+
+		it("folds a pre-#2130 entry back to its scalar root", async () => {
+			const { getAuthoritativeInstanceRoots } =
+				await import("../../clients/instance-registry.js");
+
+			expect(
+				getAuthoritativeInstanceRoots(
+					entry({ projectRoot: "/legacy", projectRoots: undefined }),
+				),
+			).toEqual(["/legacy"]);
+			expect(
+				getAuthoritativeInstanceRoots(
+					entry({
+						rootSource: "lsp-fallback",
+						projectRoot: "/guessed",
+						projectRoots: undefined,
+					}),
+				),
+			).toEqual([]);
 		});
 	});
 });

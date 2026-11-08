@@ -31,7 +31,7 @@
  * unrelated tool must not trigger light mode.
  *
  * This module only classifies the session; it does not change any behavior
- * itself. Callers (`runtime-session.ts`) gate the LSP pre-warm and the seven
+ * itself. Callers (`runtime-session.ts`) gate the LSP pre-warm and the eight
  * heavyweight external-CLI startup scans on `isSubagentSession()`. Per-edit
  * LSP dispatch is untouched — light mode must not disable diagnostics.
  *
@@ -44,6 +44,24 @@
 
 /** Which vocabulary matched when classifying the session as a subagent. */
 type SubagentMarker = "pi-subagents" | "avtc-pi-subagent" | "gentle-shell";
+
+/**
+ * Every env key this vocabulary reads: the four marker keys (the nicobailon
+ * flag, the avtc pair, the Gentle Shell flag), the run-id identity var, and the
+ * override hatch. The test worker's shared setup (`tests/support/vitest-setup.ts`)
+ * deletes exactly this list before any case runs, so a vocabulary added above
+ * without its key here would leave an inherited marker in every case's
+ * environment — callers import the list instead of spelling a second copy that
+ * can drift.
+ */
+export const SUBAGENT_VOCABULARY_KEYS = [
+	"PI_SUBAGENT_CHILD",
+	"PI_SUBAGENT_CHILD_AGENT",
+	"PI_SUBAGENT_PARENT_PID",
+	"PI_SUBAGENT_RUN_ID",
+	"GENTLE_PI_AGENTS_CHILD",
+	"PI_LENS_SUBAGENT_FULL",
+] as const;
 
 interface SubagentClassification {
 	isSubagent: boolean;

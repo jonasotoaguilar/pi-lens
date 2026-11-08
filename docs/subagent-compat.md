@@ -68,14 +68,62 @@ the marker only feeds `isSubagentSession()`:
 - The eight heavyweight external-CLI startup scans (`knip`, `jscpd`, `madge`,
   `dead-code`, `govulncheck`, `gitleaks`, `trivy`, `opengrep`) are skipped, with the
   one-per-session light-mode notice.
-- `enabledAuxiliaryLspServerIds()` returns no auxiliary servers
-  (`clients/dispatch/auxiliary-lsp.ts`): the parent on the same cwd already
-  runs opengrep, ast-grep, zizmor and typos.
+- `enabledAuxiliaryLspServerIds()` skips opengrep, ast-grep, zizmor and typos
+  (`clients/dispatch/auxiliary-lsp.ts`) ONLY while a live peer instance is
+  registered on the child's own project root — see "Peer coverage" below.
+- The turn-end LSP idle reset takes the shortened derivation
+  (`getEffectiveLspIdleResetMs()`, `clients/runtime-turn.ts`) instead of the
+  base one (#713). Both derivations floor at the full-scan wall-clock ceiling,
+  so they coincide under default constants; raising
+  `PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS` above that floor is what separates them.
+- The instance-registry row this process writes is tagged with its best-effort
+  subagent identity (`marker`, `agentType`, `parentPid`, `runId` —
+  `registerInstanceNow()`, `clients/instance-registry.ts`), and carries no
+  `subagent` field at all for a primary session.
+
+### Peer coverage: where the auxiliary skip actually comes from
+
+The auxiliary skip was written on the premise that "the parent already runs
+those four scanners on the same cwd". For an in-place fan-out that holds. It
+does NOT hold for the two delegated launches Gentle Shell performs: its agent
+runner starts the child `pi` with cwd = the requested target, else the parent
+worktree root, where the target comes from the `workspace_root` tool argument
+(another worktree of the SAME clone) or the `repository_root` argument (an
+independent repository). No environment variable carries location identity, so
+a child cannot tell from its environment whether a peer scans its tree; a blind
+skip left such a child with no auxiliary coverage of a tree no other fleet
+serves.
+
+The skip is therefore conditioned on real peer coverage rather than on the
+marker alone. At `session_start` (the same boundary that refreshes the LSP
+budget degrade) a subagent session asks the instance registry whether another
+LIVE instance holds its own project root, through the registry's own root
+accessors: `getAuthoritativeInstanceRoots()` drops the `rootSource:
+"lsp-fallback"` registration guess (that rule lives with the field, in
+`clients/instance-registry.ts`), and `selectLivePeerInstances(..., "exact")`
+is the one comparator. Only a same-root live peer suppresses the fleet.
+Everything unknown — an unreadable or torn registry, a guessed root, a probe
+that has not answered yet — enables it, so a delegated child keeps its own
+opengrep/ast-grep/typos/zizmor instead of silently scanning nothing. Each
+subagent session writes one
+`subagent_auxiliary_peer_coverage` row (`latency.log`, claimed once per session
+root) with `peerCovered`, `peerCount` and `registryEntries`, so the trade is
+observable from the log rather than inferred from the absence of findings.
+
+Cross-worktree consequence: two worktrees of one clone are two project roots,
+so the child's root is normally uncovered and the child runs its own fleet.
+A child started in the PARENT's worktree root is covered by the parent and
+keeps the skip, which is the case the original behavior was written for.
+`tests/clients/dispatch/auxiliary-lsp-peer-coverage.test.ts` carries the
+coverage matrix (covered, no peer, different root, containing root, dead pid,
+unreadable registry, guessed root, second root, `PI_LENS_SUBAGENT_FULL=1`,
+primary session, superseded session, once-per-session record).
 
 Indexes such as the symbol index are NOT covered by light mode — the same
 accepted scope as the other vocabularies. `PI_LENS_SUBAGENT_FULL=1` stays the
-universal opt-out: it short-circuits `isSubagentSession()`, restoring the
-pre-warm, all seven scans and the auxiliary fleet for a Gentle Shell child too.
+universal opt-out: it short-circuits `isSubagentSession()`, so a Gentle Shell
+child too gets the pre-warm, all eight scans, the auxiliary fleet, the base
+idle reset and an untagged instance-registry row.
 `tests/clients/dispatch/auxiliary-lsp.test.ts` carries the runtime witness for
 both directions, and `tests/clients/subagent-mode.test.ts` pins detection,
 non-`"1"` values, the marker name, the override and the precedence of the two
@@ -85,7 +133,7 @@ older vocabularies when this marker is also set.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected subagent child session — nicobailon/pi-subagents (`PI_SUBAGENT_CHILD=1`), avtc-pi-subagent (`PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, #507) or Gentle Shell (`GENTLE_PI_AGENTS_CHILD=1`) — disables the light-mode heavyweight-scan skip for every vocabulary. |
+| `PI_LENS_SUBAGENT_FULL` | unset (light mode auto-detects) | Set to `1` to force full (non-light) behavior even inside a detected subagent child session — nicobailon/pi-subagents (`PI_SUBAGENT_CHILD=1`), avtc-pi-subagent (`PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair, #507) or Gentle Shell (`GENTLE_PI_AGENTS_CHILD=1`) — returns every light-mode gate for every vocabulary: the LSP pre-warm, all eight heavyweight scans, the auxiliary fleet, the shortened idle reset and the instance-registry subagent tag. |
 | `PI_LENS_CONCURRENT_SESSION_GUARD` | unset (guard enabled) | Set to `0` to disable the #473 concurrent-session guard entirely — every `session_start` classifies as sequential replacement (pre-#473 behavior: a concurrent in-process bind would run the full reset, tearing down the parent's live LSP fleet). |
 | `PI_LENS_INSTANCE_REGISTRY` | unset (registry enabled) | Set to `0` to disable the #474 cross-process instance registry — no orphan-LSP reaping happens at `session_start`, but also no new risk (registry writes are best-effort and already fail open). |
 
@@ -157,8 +205,9 @@ Assertions:
 
 1. **Subagent light mode engages** — with `PI_SUBAGENT_CHILD=1` set,
    `subagent_light_mode` is logged to `$PI_LENS_HOME/latency.log` (a `type:
-   "phase"` entry) and none of the seven heavyweight-scan phases
-   (`knip`/`jscpd`/`madge`/`dead-code`/`govulncheck`/`gitleaks`/`trivy`) are
+   "phase"` entry) and none of the heavyweight-scan phases the smoke checks
+   (`knip`/`jscpd`/`madge`/`dead-code`/`govulncheck`/`gitleaks`/`trivy`; the
+   light-mode gate skips `opengrep` too, but this smoke does not assert it) are
    logged for that run.
 2. **`PI_LENS_SUBAGENT_FULL=1` overrides it off** — with both
    `PI_SUBAGENT_CHILD=1` and `PI_LENS_SUBAGENT_FULL=1` set, no
@@ -176,8 +225,8 @@ Assertions:
    fixed.
 4. **avtc-pi-subagent PAIR engages light mode** (#507/#518) — with only
    `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` set (no
-   `PI_SUBAGENT_CHILD`), `subagent_light_mode` is logged and none of the
-   seven heavyweight-scan phases are — same detection as assertion 1,
+   `PI_SUBAGENT_CHILD`), `subagent_light_mode` is logged and none of those
+   heavyweight-scan phases are — same detection as assertion 1,
    exercised through the second vocabulary.
 5. **avtc-pi-subagent LONE var does NOT engage light mode** (#507/#518) — the
    inverse guard: with only `PI_SUBAGENT_CHILD_AGENT` set (no
