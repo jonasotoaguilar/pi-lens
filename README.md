@@ -6,6 +6,48 @@
 
 [![omp status](https://omppackages.com/badge/pi-lens.svg)](https://omppackages.com/packages/pi-lens)
 
+## This fork
+
+This is the [jonasotoaguilar](https://github.com/jonasotoaguilar/pi-lens) fork. It tracks
+upstream and adds [Gentle Shell](https://github.com/Gentleman-Programming/gentle-shell)
+support, so Gentle Shell subagents run pi-lens in light mode instead of paying full startup
+cost in every child:
+
+- Gentle Shell marks its child `pi` processes with `GENTLE_PI_AGENTS_CHILD=1`. This fork
+  recognizes that marker as a third subagent vocabulary, beside `PI_SUBAGENT_CHILD=1` and
+  the `PI_SUBAGENT_CHILD_AGENT` + `PI_SUBAGENT_PARENT_PID` pair. A detected child skips the
+  dominant-language LSP pre-warm, the eight heavyweight startup scans and the auxiliary LSP
+  fleet; per-edit diagnostics, formatting, autofix and the symbol indexes stay on.
+  `PI_LENS_SUBAGENT_FULL=1` still forces full behavior for every vocabulary.
+- The auxiliary LSP fleet is skipped only when a live peer instance already covers the
+  child's own project root. A child delegated to another worktree (`workspace_root`) or an
+  independent repository (`repository_root`) keeps its own fleet, because no peer serves
+  that tree. When the peer check cannot answer, the fleet is enabled: the failure direction
+  costs memory instead of dropping findings.
+- The shared test setup deletes the whole subagent vocabulary from the worker environment,
+  so a suite running inside a subagent child no longer turns ordinary cases into light-mode
+  cases.
+
+Details: [docs/subagent-compat.md](docs/subagent-compat.md).
+
+### Install from this fork
+
+pi installs a package from a git source, not from `npm`. Point it at the fork and pi clones,
+builds and loads it:
+
+```bash
+pi install git:github.com/jonasotoaguilar/pi-lens
+```
+
+If the published package is also configured, remove it so one pi-lens loads:
+
+```bash
+pi remove npm:pi-lens
+```
+
+`pi update --extensions` fetches the fork's default branch. Append `@<commit>` to the source,
+for example `git:github.com/jonasotoaguilar/pi-lens@e3116131d`, to pin one commit instead.
+
 pi-lens gives AI coding agents fast, language-aware feedback while they write/edit.
 
 > **Working in this project as an AI agent?** Read the [agent guide](docs/agent-guide.md)
