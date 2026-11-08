@@ -19,7 +19,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 
 const latencyCalls: Array<Record<string, unknown>> = [];
 vi.mock("../../clients/latency-logger.js", async (importActual) => {
@@ -42,6 +50,10 @@ import {
 	isGitCommitOrPushAttempt,
 	resolveGitTargetDirectory,
 } from "../../clients/git-guard.js";
+import {
+	_resetSubagentModeForTests,
+	SUBAGENT_VOCABULARY_KEYS,
+} from "../../clients/subagent-mode.js";
 import type { InstanceEntry } from "../../clients/instance-registry.js";
 import { selectLivePeerInstances } from "../../clients/instance-registry.js";
 import {
@@ -777,6 +789,168 @@ describe("evaluateSharedCheckoutGuard (#2007)", () => {
 			deps(),
 		);
 		expect(phaseCalls("shared_checkout_switch_blocked")).toHaveLength(2);
+	});
+});
+
+/**
+ * D1: Gentle Shell siblings on one checkout.
+ *
+ * An orchestrator that delegates several children to ONE worktree makes those
+ * children live peers of each other, so the #2007 guard refused every
+ * branch-mutating git verb in all of them — it saw live peers on the same tree
+ * and a dirty tree. The first case below is that refusal, driven through the
+ * real `evaluateSharedCheckoutGuard` with a registry fixture shaped exactly as
+ * a child's own `registerInstance` writes it (`subagent` stamped from
+ * `isSubagentSession()`, no parent pid for the Gentle Shell vocabulary).
+ */
+describe("subagent siblings sharing one checkout (D1)", () => {
+	const PRIMARY_PID = process.pid + 10;
+	const SIBLING_PID = process.pid + 11;
+	const SECOND_SIBLING_PID = process.pid + 12;
+
+	let savedEnv: Record<string, string | undefined>;
+
+	beforeEach(() => {
+		savedEnv = {};
+		for (const key of SUBAGENT_VOCABULARY_KEYS) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		_resetSubagentModeForTests();
+		latencyCalls.length = 0;
+		resetDegradationLedger();
+	});
+
+	afterEach(() => {
+		for (const key of SUBAGENT_VOCABULARY_KEYS) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+		_resetSubagentModeForTests();
+	});
+
+	/** This process as Gentle Shell launches it: the marker and nothing else. */
+	function asGentleShellChild(): void {
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		_resetSubagentModeForTests();
+	}
+
+	/** A sibling child's row: what a Gentle Shell child registers about itself. */
+	function childRow(
+		pid: number,
+		overrides: Partial<InstanceEntry> = {},
+	): InstanceEntry {
+		return peer({ pid, subagent: { marker: "gentle-shell" }, ...overrides });
+	}
+
+	/** A primary (non-subagent) session's row: no `subagent` field at all. */
+	function primaryRow(overrides: Partial<InstanceEntry> = {}): InstanceEntry {
+		return peer({ pid: PRIMARY_PID, ...overrides });
+	}
+
+	function allowReasonCategories(): unknown[] {
+		return phaseCalls("shared_checkout_guard_allow").map(
+			(entry) => (entry.metadata as { reasonCategory: string }).reasonCategory,
+		);
+	}
+
+	it("RED (D1): declines a child's branch switch because its siblings are live here", async () => {
+		asGentleShellChild();
+		const probeSpy = { calls: 0 };
+		const decision = await evaluateSharedCheckoutGuard(
+			"bash",
+			bash("git checkout main"),
+			ROOT,
+			deps(
+				{
+					readRegistry: async () => [
+						childRow(SIBLING_PID),
+						childRow(SECOND_SIBLING_PID),
+					],
+				},
+				probeSpy,
+			),
+		);
+		// MUTATION PROOF: count every live peer again (drop the sibling filter)
+		// and this is the D1 refusal, quoted verbatim in the diff.
+		expect(decision.block ? decision.reason : "(allowed)").toBe("(allowed)");
+		expect(allowReasonCategories()).toEqual(["subagent_siblings_only"]);
+		// The working-tree probe is the expensive half of the decision and it
+		// answers a question about peers that are not at risk; a sibling-only
+		// checkout must not pay it.
+		expect(probeSpy.calls).toBe(0);
+	});
+
+	it("still declines a child when a PRIMARY session shares its checkout", async () => {
+		asGentleShellChild();
+		const decision = await evaluateSharedCheckoutGuard(
+			"bash",
+			bash("git reset --hard"),
+			ROOT,
+			deps({
+				readRegistry: async () => [primaryRow(), childRow(SIBLING_PID)],
+			}),
+		);
+		// MUTATION PROOF: exempt every peer once the caller is a subagent, or key
+		// the exemption on "some peer is a subagent", and this reds — the primary
+		// session's uncommitted work is exactly what the guard exists for.
+		expect(decision.block).toBe(true);
+		expect(decision.reason).toContain("uncommitted changes");
+		// The refusal must still name the session it is protecting, and only that
+		// one: the exempt sibling is not a blocker and must not be named as one.
+		expect(decision.reason).toContain(
+			`1 other live pi-lens session (pid ${PRIMARY_PID}`,
+		);
+		expect(decision.reason).not.toContain(`pid ${SIBLING_PID}`);
+		expect(
+			phaseCalls("shared_checkout_switch_blocked")[0]?.metadata,
+		).toMatchObject({ decision: "blocked", peerCount: 1 });
+	});
+
+	it("keeps blocking a PRIMARY session whose checkout a subagent child shares", async () => {
+		// No marker in this process: an ordinary session. Its protection must not
+		// depend on how its peers classify themselves.
+		const decision = await evaluateSharedCheckoutGuard(
+			"bash",
+			bash("git checkout main"),
+			ROOT,
+			deps({ readRegistry: async () => [childRow(SIBLING_PID)] }),
+		);
+		// MUTATION PROOF: drop subagent-marked peers unconditionally instead of
+		// only for a subagent caller, and this reds — every primary session would
+		// stop being protected from a child's branch switch.
+		expect(decision.block).toBe(true);
+		expect(decision.reason).toContain(`pid ${SIBLING_PID}`);
+	});
+
+	it("keeps blocking a child when the peer row carries no subagent identity", async () => {
+		// A row written by a pi-lens that predates the field, or by a peer whose
+		// vocabulary left identity unset. Unrecognised peers fail toward refusal.
+		asGentleShellChild();
+		const decision = await evaluateSharedCheckoutGuard(
+			"bash",
+			bash("git checkout main"),
+			ROOT,
+			deps({ readRegistry: async () => [peer({ pid: PRIMARY_PID })] }),
+		);
+		expect(decision.block).toBe(true);
+		expect(decision.reason).toContain(`pid ${PRIMARY_PID}`);
+	});
+
+	it("keeps the full guard for a child that opts into PI_LENS_SUBAGENT_FULL=1", async () => {
+		// The escape hatch means "behave like a full session", and the guard is
+		// part of full behavior: the same sibling set blocks it.
+		asGentleShellChild();
+		process.env.PI_LENS_SUBAGENT_FULL = "1";
+		_resetSubagentModeForTests();
+		const decision = await evaluateSharedCheckoutGuard(
+			"bash",
+			bash("git checkout main"),
+			ROOT,
+			deps({ readRegistry: async () => [childRow(SIBLING_PID)] }),
+		);
+		expect(decision.block).toBe(true);
+		expect(decision.reason).toContain(`pid ${SIBLING_PID}`);
 	});
 });
 
