@@ -750,6 +750,32 @@ process.env.PI_CODING_AGENT_DIR = path.join(tmpHygieneHome, "agent");
 fs.mkdirSync(path.join(tmpHygieneHome, "agent"), { recursive: true });
 installGitFixtureEnv(tmpHygieneHome);
 
+// #475/#713: the subagent vocabulary is a property of the process that RUNS
+// pi-lens, so a worker started from a subagent child inherits one: every Gentle
+// Shell child sets `GENTLE_PI_AGENTS_CHILD=1`, and a worker this suite starts on
+// a Gentle Shell lane carries it. Every seam that asks `isSubagentSession()`
+// then answers light mode in a case that never chose it — the auxiliary-LSP,
+// warmup and instance-registry cases measured it: 11 red on such a worker once
+// no per-file pin covered them, 0 with the marker unset. Deleting the whole
+// vocabulary makes "no marker" the
+// state a case starts in, for the file's cases AND for the children they spawn.
+// A case that wants a subagent posture sets its marker itself
+// (`tests/clients/subagent-mode.test.ts`, the auxiliary-LSP gate cases).
+//
+// Never restored, like the pins above: putting an inherited marker back would
+// re-arm exactly the light mode every case here exists to keep out of its own
+// run. `PI_LENS_SUBAGENT_FULL` is in the list for the same reason — a lane that
+// exports it must not decide for a case whether full or light behavior runs.
+const SUBAGENT_VOCABULARY_KEYS = [
+	"GENTLE_PI_AGENTS_CHILD",
+	"PI_SUBAGENT_CHILD",
+	"PI_SUBAGENT_CHILD_AGENT",
+	"PI_SUBAGENT_PARENT_PID",
+	"PI_SUBAGENT_RUN_ID",
+	"PI_LENS_SUBAGENT_FULL",
+] as const;
+for (const key of SUBAGENT_VOCABULARY_KEYS) delete process.env[key];
+
 // #3083: session_start reaches the backstop transitively through index.js.
 // Pin the filesystem location once for every file, without a caller registry
 // or changing #2912's shared home. Explicit per-case homes remain authoritative.
