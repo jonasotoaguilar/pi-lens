@@ -25,6 +25,7 @@ import {
 	isWarmAttached,
 	tryWarmAttachedCodeActions,
 	tryWarmAttachedDiagnostics,
+	warmAttachAttachment,
 } from "../../clients/warm-attach.js";
 import {
 	connectOutcome,
@@ -44,6 +45,39 @@ function entry(pid: number, root: string, heartbeatAt: string): InstanceEntry {
 		heartbeatAt,
 	};
 }
+
+/**
+ * #713 premise 2: the auxiliary-skip gate asks WHAT this process is attached
+ * to, not only whether it is attached. `isWarmAttached()` and the accessor are
+ * one predicate — the boolean is the accessor's presence — so the two can
+ * never answer differently. The root is stored as configured, so a caller
+ * comparing roots compares the tree this session attached for.
+ */
+describe("warmAttachAttachment", () => {
+	const cwd = path.resolve("/repo/warm-attach-attachment");
+
+	afterEach(() => {
+		_resetWarmAttachForTests();
+	});
+
+	it("reports no attachment while this process runs its own servers", () => {
+		expect(warmAttachAttachment()).toBeUndefined();
+		expect(isWarmAttached()).toBe(false);
+	});
+
+	it("reports the root and the incumbent it reads from", () => {
+		_setWarmAttachForTests(cwd, 4_321);
+		expect(warmAttachAttachment()).toEqual({ root: cwd, incumbentPid: 4_321 });
+		expect(isWarmAttached()).toBe(true);
+	});
+
+	it("drops the attachment when a dead incumbent promotes the session to local", async () => {
+		_setWarmAttachForTests(cwd, 999_999);
+		await tryWarmAttachedDiagnostics("app.ts", "x", 10);
+		expect(warmAttachAttachment()).toBeUndefined();
+		expect(isWarmAttached()).toBe(false);
+	});
+});
 
 describe("selectWarmAttachIncumbent", () => {
 	const now = Date.now();

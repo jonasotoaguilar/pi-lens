@@ -19,11 +19,16 @@ cost in every child:
   dominant-language LSP pre-warm, the eight heavyweight startup scans and the auxiliary LSP
   fleet; per-edit diagnostics, formatting, autofix and the symbol indexes stay on.
   `PI_LENS_SUBAGENT_FULL=1` still forces full behavior for every vocabulary.
-- The auxiliary LSP fleet is skipped only when a live peer instance already covers the
-  child's own project root. A child delegated to another worktree (`workspace_root`) or an
-  independent repository (`repository_root`) keeps its own fleet, because no peer serves
-  that tree. When the peer check cannot answer, the fleet is enabled: the failure direction
-  costs memory instead of dropping findings.
+- The auxiliary LSP fleet is skipped only while BOTH hold: a live peer instance already covers
+  the child's own project root, and warm attach (`PI_LENS_WARM_ATTACH=1`) is actually attached to
+  that peer for that root, so the child reads that fleet's answers. A child delegated to another
+  worktree (`workspace_root`) or an independent repository (`repository_root`) keeps its own fleet,
+  because no peer serves that tree — and so does a child that is not warm-attached, which is the
+  default. Those children pay for their own opengrep/ast-grep/zizmor/typos servers; every other
+  light-mode saving still applies. The decision is re-checked on each use: without the attachment,
+  or once the incumbent goes away, the session enables its fleet and stays enabled. When the peer
+  check cannot answer, the fleet is enabled: the failure direction costs memory instead of dropping
+  findings.
 - The shared test setup deletes the whole subagent vocabulary from the worker environment,
   so a suite running inside a subagent child no longer turns ordinary cases into light-mode
   cases.

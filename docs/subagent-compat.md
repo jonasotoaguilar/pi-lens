@@ -70,7 +70,9 @@ the marker only feeds `isSubagentSession()`:
   one-per-session light-mode notice.
 - `enabledAuxiliaryLspServerIds()` skips opengrep, ast-grep, zizmor and typos
   (`clients/dispatch/auxiliary-lsp.ts`) ONLY while a live peer instance is
-  registered on the child's own project root — see "Peer coverage" below.
+  registered on the child's own project root AND warm attach is attached to
+  that peer for that root — see "Peer coverage" below. Without warm attach the
+  child runs its own fleet.
 - The turn-end LSP idle reset takes the shortened derivation
   (`getEffectiveLspIdleResetMs()`, `clients/runtime-turn.ts`) instead of the
   base one (#713). Both derivations floor at the full-scan wall-clock ceiling,
@@ -95,29 +97,64 @@ skip left such a child with no auxiliary coverage of a tree no other fleet
 serves.
 
 The skip is therefore conditioned on real peer coverage rather than on the
-marker alone. At `session_start` (the same boundary that refreshes the LSP
-budget degrade) a subagent session asks the instance registry whether another
-LIVE instance holds its own project root, through the registry's own root
-accessors: `getAuthoritativeInstanceRoots()` drops the `rootSource:
-"lsp-fallback"` registration guess (that rule lives with the field, in
-`clients/instance-registry.ts`), and `selectLivePeerInstances(..., "exact")`
-is the one comparator. Only a same-root live peer suppresses the fleet.
+marker alone, and it needs TWO premises — a registered fleet is not the same
+fact as an obtainable one:
+
+1. a LIVE peer instance holds the child's own project root, and
+2. warm attach is attached to that peer for that same root, so the child
+   actually reads that fleet's answers.
+
+At `session_start` (the same boundary that refreshes the LSP budget degrade) a
+subagent session reads the instance registry through its own root accessors:
+`getAuthoritativeInstanceRoots()` drops the `rootSource: "lsp-fallback"`
+registration guess (that rule lives with the field, in
+`clients/instance-registry.ts`), and `selectLivePeerInstances(..., "exact")` is
+the one comparator. It then asks warm attach, through
+`warmAttachAttachment()`, which root it is attached for and whose fleet it
+reads; the attached incumbent must be one of the live peers found on that root.
 Everything unknown — an unreadable or torn registry, a guessed root, a probe
-that has not answered yet — enables it, so a delegated child keeps its own
-opengrep/ast-grep/typos/zizmor instead of silently scanning nothing. Each
-subagent session writes one
+that has not answered yet, no attachment, an attachment for another root, an
+attached process that is not the root's peer — enables the fleet, so a
+delegated child keeps its own opengrep/ast-grep/typos/zizmor instead of
+silently scanning nothing. Each subagent session writes one
 `subagent_auxiliary_peer_coverage` row (`latency.log`, claimed once per session
-root) with `peerCovered`, `peerCount` and `registryEntries`, so the trade is
-observable from the log rather than inferred from the absence of findings.
+root) with `peerCovered`, `peerCount`, `registryEntries`, `attached`,
+`attachedRootMatches` and `attachedIncumbentPid`, so the trade is observable
+from the log rather than inferred from the absence of findings.
+
+The decision is cached for the synchronous dispatch gate but bound to the ROOT
+it was computed for, and re-validated on every read: a read compares that root
+with the root warm attach is now attached for, checks the same incumbent, and
+probes its pid. A process that holds two roots therefore cannot answer for the
+root it did not measure, and a premise that stops holding (an incumbent that
+exits, a takeover that drops the attachment, a second root) re-arms the session
+to ENABLED — once, permanently for that session, with one
+`subagent_auxiliary_peer_coverage_rearmed` row naming the reason. The transition
+is deliberately one-way: a session that has re-armed never flaps back to a
+silent skip.
+
+**Cost for a child without warm attach.** The skip is now unavailable to every
+subagent session that is not warm-attached, which is the default: warm attach
+is opt-in behind `PI_LENS_WARM_ATTACH=1`. Such a child runs its own
+opengrep/ast-grep/zizmor/typos fleet — real server processes and their
+rule/dictionary compilation — instead of scanning nothing. Children stay light
+in every other way (LSP pre-warm and the eight heavyweight startup scans are
+still skipped), and `PI_LENS_SUBAGENT_FULL=1` remains the explicit opt-in to the
+full fleet everywhere.
 
 Cross-worktree consequence: two worktrees of one clone are two project roots,
 so the child's root is normally uncovered and the child runs its own fleet.
-A child started in the PARENT's worktree root is covered by the parent and
-keeps the skip, which is the case the original behavior was written for.
+A child started in the PARENT's worktree root IS covered by the parent, but it
+also has to be warm-attached to the parent's fleet to skip, which is what the
+original behavior silently assumed.
 `tests/clients/dispatch/auxiliary-lsp-peer-coverage.test.ts` carries the
 coverage matrix (covered, no peer, different root, containing root, dead pid,
-unreadable registry, guessed root, second root, `PI_LENS_SUBAGENT_FULL=1`,
-primary session, superseded session, once-per-session record).
+unreadable registry, guessed root, second root, no attachment, attachment for
+another root, attached process not the root's peer, incumbent gone after the
+decision, incumbent dead after the decision, no flip back, one record per
+session, `PI_LENS_SUBAGENT_FULL=1`, primary session, superseded session,
+once-per-session record), and `tests/clients/warm-attach.test.ts` pins the
+attachment accessor itself.
 
 Indexes such as the symbol index are NOT covered by light mode — the same
 accepted scope as the other vocabularies. `PI_LENS_SUBAGENT_FULL=1` stays the

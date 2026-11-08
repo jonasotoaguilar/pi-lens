@@ -435,7 +435,35 @@ export async function tryWarmAttachedCodeActions(
 }
 
 export function isWarmAttached(): boolean {
-	return !state.local && state.incumbentPid !== undefined;
+	return warmAttachAttachment() !== undefined;
+}
+
+/**
+ * What this process is attached to. `isWarmAttached()` answers WHETHER this
+ * session reads another process's servers; a caller that needs to know which
+ * tree those answers describe has to ask for the root and the incumbent
+ * together (#713 review A1).
+ */
+export interface WarmAttachAttachment {
+	/** The root `configureWarmAttach` was called for, resolved as it stores it. */
+	root: string;
+	/** The instance whose servers answer this session's requests. */
+	incumbentPid: number;
+}
+
+/**
+ * The attachment this process holds, or `undefined` while it runs — and answers
+ * for — its own servers. The ONE reader of the attached state: `isWarmAttached`
+ * is this accessor's presence, so the two can never disagree.
+ */
+export function warmAttachAttachment(): WarmAttachAttachment | undefined {
+	if (
+		state.local ||
+		state.incumbentPid === undefined ||
+		state.cwd === undefined
+	)
+		return undefined;
+	return { root: state.cwd, incumbentPid: state.incumbentPid };
 }
 
 function promoteToLocal(reason: string): void {
