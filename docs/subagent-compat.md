@@ -90,6 +90,18 @@ the marker only feeds `isSubagentSession()`:
   subagent identity (`marker`, `agentType`, `parentPid`, `runId` —
   `registerInstanceNow()`, `clients/instance-registry.ts`), and carries no
   `subagent` field at all for a primary session.
+- The shared-checkout guard exempts an ephemeral subagent session from its own
+  siblings: a branch-mutating git verb is refused only when a live
+  **non-subagent** peer shares the tree, or when a peer row carries no
+  `subagent` field at all, which fails toward refusal. A primary session keeps
+  blocking every child, so the incident class the guard exists for is
+  unchanged; the accepted exposure is child against child, on a tree the
+  orchestrator chose to share. `PI_LENS_SUBAGENT_FULL=1` restores the full
+  guard for a child that opts in.
+- A child that loses the machine-global install lock asks discovery once more
+  before recording a skip, so a fan-out on a machine missing a tool does not
+  leave every loser without it. A wait that expires with nothing installed
+  still records the skip with its reason.
 
 ### Peer coverage: where the auxiliary skip actually comes from
 

@@ -38,6 +38,17 @@ cost in every child:
 - The shared test setup deletes the whole subagent vocabulary from the worker environment,
   so a suite running inside a subagent child no longer turns ordinary cases into light-mode
   cases.
+- Sibling children in one worktree no longer block each other's git commands. The
+  shared-checkout guard exempts a child only when every live peer that would block it is
+  itself a subagent session; a live non-subagent session on the same tree still blocks, an
+  unrecognised peer still blocks, and `PI_LENS_SUBAGENT_FULL=1` keeps the full guard. The
+  accepted cost: one delegated task can overwrite a sibling's uncommitted edits on a tree
+  with no live primary.
+- The LSP budget is charged per project root, with a machine-wide stop above it, so a fan-out
+  across several roots no longer degrades a session whose own root is under its share
+  (`clients/lsp-budget.ts`).
+- A child that loses the race for the machine-global install lock adopts the tool the winner
+  installed instead of running the session without it.
 
 Details: [docs/subagent-compat.md](docs/subagent-compat.md).
 
