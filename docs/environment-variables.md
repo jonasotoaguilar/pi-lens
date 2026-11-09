@@ -233,10 +233,14 @@ warm LSP of a live incumbent session.
 ### `PI_LENS_WARM_ATTACH`
 
 Set to `1` to opt into the same-workspace warm-attach soak (#822). A second
-session reuses a live incumbent session's LSP diagnostics over local IPC.
-Unset or `0` preserves the prior local-LSP behavior exactly. Any transport,
-schema, freshness, deadline, or incumbent-liveness failure permanently falls
-back to a local LSP fleet for that session.
+session reuses a live incumbent session's LSP diagnostics over local IPC,
+connecting to the endpoint the incumbent recorded in the instance registry
+rather than re-deriving it, so a child process whose `TMPDIR` differs from its
+parent's still attaches. An incumbent that recorded nothing is reached through
+the derived path, the previous behavior. Unset or `0` preserves the prior
+local-LSP behavior exactly. Any transport, schema, freshness, deadline, or
+incumbent-liveness failure permanently falls back to a local LSP fleet for that
+session.
 
 ## Variables pi-lens sets for its child processes
 

@@ -19,14 +19,36 @@ cost in every child:
   dominant-language LSP pre-warm, the eight heavyweight startup scans and the auxiliary LSP
   fleet; per-edit diagnostics, formatting, autofix and the symbol indexes stay on.
   `PI_LENS_SUBAGENT_FULL=1` still forces full behavior for every vocabulary.
-- The auxiliary LSP fleet is skipped only when a live peer instance already covers the
-  child's own project root. A child delegated to another worktree (`workspace_root`) or an
-  independent repository (`repository_root`) keeps its own fleet, because no peer serves
-  that tree. When the peer check cannot answer, the fleet is enabled: the failure direction
-  costs memory instead of dropping findings.
+- The auxiliary LSP fleet is skipped only while BOTH hold: a live peer instance already covers
+  the child's own project root, and warm attach (`PI_LENS_WARM_ATTACH=1`) is actually attached to
+  that peer for that root, so the child reads that fleet's answers. A child delegated to another
+  worktree (`workspace_root`) or an independent repository (`repository_root`) keeps its own fleet,
+  because no peer serves that tree — and so does a child that is not warm-attached, which is the
+  default. Those children pay for their own opengrep/ast-grep/zizmor/typos servers; every other
+  light-mode saving still applies. The decision is re-checked on each use: without the attachment,
+  or once the incumbent goes away, the session enables its fleet and stays enabled. When the peer
+  check cannot answer, the fleet is enabled: the failure direction costs memory instead of dropping
+  findings.
+- Warm attach (`PI_LENS_WARM_ATTACH=1`) now works between a Gentle Shell child and its parent even
+  though Gentle Shell gives every child its own temporary directory. Each session records the
+  diagnostics socket it actually listens on, and an attaching session connects to that recorded
+  path instead of deriving one from its own tmp root. A peer that records nothing keeps the
+  previous derivation, so an older pi-lens degrades to today's behavior instead of dialing a
+  wrong path, and a recorded path that no longer answers falls back to the local fleet as before.
 - The shared test setup deletes the whole subagent vocabulary from the worker environment,
   so a suite running inside a subagent child no longer turns ordinary cases into light-mode
   cases.
+- Sibling children in one worktree no longer block each other's git commands. The
+  shared-checkout guard exempts a child only when every live peer that would block it is
+  itself a subagent session; a live non-subagent session on the same tree still blocks, an
+  unrecognised peer still blocks, and `PI_LENS_SUBAGENT_FULL=1` keeps the full guard. The
+  accepted cost: one delegated task can overwrite a sibling's uncommitted edits on a tree
+  with no live primary.
+- The LSP budget is charged per project root, with a machine-wide stop above it, so a fan-out
+  across several roots no longer degrades a session whose own root is under its share
+  (`clients/lsp-budget.ts`).
+- A child that loses the race for the machine-global install lock adopts the tool the winner
+  installed instead of running the session without it.
 
 Details: [docs/subagent-compat.md](docs/subagent-compat.md).
 

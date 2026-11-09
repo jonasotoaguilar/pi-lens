@@ -211,6 +211,31 @@ export function unlinkStaleUnixSocket(
 	}
 }
 
+/**
+ * The endpoint a client connects to for an incumbent's warm diagnostics.
+ *
+ * An incumbent PUBLISHES the name it bound in its instance-registry entry
+ * (`diagnosticsEndpoint`), and that string is used as it stands: the `sun_path`
+ * cut already happened at bind time, and cutting or re-spelling it here could
+ * only disagree with the file that exists. This is what lets a reader whose own
+ * `os.tmpdir()` differs — every Gentle Shell child, whose runner gives each
+ * child `mkdtemp` under the inherited root — reach the incumbent at all.
+ *
+ * A peer that publishes nothing (any pi-lens older than the field, and a
+ * process that bound no listener) keeps the derived name, so it degrades to the
+ * previous behavior instead of connecting somewhere wrong.
+ */
+export function peerDiagnosticsEndpoint(
+	cwd: string,
+	incumbentPid: number,
+	publishedEndpoint: string | undefined,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return publishedEndpoint !== undefined && publishedEndpoint.length > 0
+		? publishedEndpoint
+		: diagnosticsIpcPathForCwd(cwd, incumbentPid, platform);
+}
+
 export interface WarmDiagnosticsRequest {
 	route: "diagnostics";
 	version: number;
@@ -430,10 +455,11 @@ export function requestWarmDiagnostics(
 	file: string,
 	content: string,
 	timeoutMs: number,
+	publishedEndpoint?: string,
 ): Promise<WarmDiagnosticsResult> {
 	const expectedHash = contentHash(content);
 	return requestOverWarmIpc<WarmDiagnosticsResponse>(
-		diagnosticsIpcPathForCwd(cwd, incumbentPid),
+		peerDiagnosticsEndpoint(cwd, incumbentPid, publishedEndpoint),
 		timeoutMs,
 		(deadlineAt): WarmDiagnosticsRequest => ({
 			route: "diagnostics",
@@ -471,9 +497,10 @@ export function requestWarmCodeActions(
 	expectedContentHash: string,
 	ranges: WarmCodeActionRange[],
 	timeoutMs: number,
+	publishedEndpoint?: string,
 ): Promise<WarmCodeActionsResult> {
 	return requestOverWarmIpc<WarmCodeActionsResponse>(
-		diagnosticsIpcPathForCwd(cwd, incumbentPid),
+		peerDiagnosticsEndpoint(cwd, incumbentPid, publishedEndpoint),
 		timeoutMs,
 		(deadlineAt): WarmCodeActionsRequest => ({
 			route: "code-actions",

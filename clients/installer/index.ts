@@ -6702,6 +6702,20 @@ export async function ensureTool(
 	return ensureToolResolved(toolId, opts);
 }
 
+/**
+ * Take the binary a concurrent installer left behind: no lock held, no package
+ * manager run. Both callers are the loser of the machine-global install race —
+ * the lock waiter whose predecessor already installed this tool, and the waiter
+ * whose own bounded wait expired after that install landed (D5: it used to
+ * record `skipped` and spend the session without the tool).
+ */
+function adoptConcurrentInstall(toolId: string, installedPath: string): string {
+	noteInstallAttempt(toolId, "succeeded", "installed by a concurrent process");
+	resolvedPathCache.set(toolId, installedPath);
+	void updateProbeCache(toolId, installedPath, wasLastResolveTransient(toolId));
+	return installedPath;
+}
+
 async function ensureToolResolved(
 	toolId: string,
 	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
@@ -6924,6 +6938,19 @@ async function ensureToolResolved(
 
 		const lock = await acquireInstallLock();
 		if (!lock.release) {
+			// D5: the bounded wait lost the race. A peer may have FINISHED with this
+			// tool while we waited, so ask once more — the same question the lock
+			// waiter asks below — before spending the session without it. Only the
+			// wait is bounded; the resolution is the ordinary discovery probe.
+			// The force-reinstall branch above stays out: there the caller asked for
+			// a fresh install, and a peer's older binary is not that answer.
+			const installedWhileWaiting = await getToolPath(toolId);
+			if (installedWhileWaiting) {
+				logSessionStart(
+					`auto-install ensure ${toolId}: ${lock.reason} — a concurrent install landed; using it (${Date.now() - ensureStartMs}ms)`,
+				);
+				return adoptConcurrentInstall(toolId, installedWhileWaiting);
+			}
 			installFailureReasons.set(toolId, lock.reason ?? "install lock failed");
 			noteInstallAttempt(toolId, "skipped", lock.reason ?? "install lock held");
 			logSessionStart(`auto-install ensure ${toolId}: ${lock.reason}`);
@@ -6934,20 +6961,8 @@ async function ensureToolResolved(
 			// Cross-process double-check: the lock waiter may now observe the tool
 			// installed by its predecessor and must not run a second package manager.
 			const installedByPeer = await getToolPath(toolId);
-			if (installedByPeer) {
-				noteInstallAttempt(
-					toolId,
-					"succeeded",
-					"installed by a concurrent process",
-				);
-				resolvedPathCache.set(toolId, installedByPeer);
-				void updateProbeCache(
-					toolId,
-					installedByPeer,
-					wasLastResolveTransient(toolId),
-				);
-				return installedByPeer;
-			}
+			if (installedByPeer)
+				return adoptConcurrentInstall(toolId, installedByPeer);
 			installed = await installTool(toolId, lock.ownsLock);
 		} finally {
 			await lock.release();

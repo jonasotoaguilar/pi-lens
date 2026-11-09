@@ -171,6 +171,19 @@ export interface InstanceEntry {
 	projectRootHolders?: Record<string, string[]>;
 	lspChildren: LspChildEntry[];
 	lspChildCount: number;
+	/**
+	 * The diagnostics IPC endpoint this host BOUND for warm attach, spelled
+	 * exactly as the OS accepted it (`clients/mcp/ipc.ts`'s
+	 * `boundUnixSocketPath`), so a peer whose own `os.tmpdir()` differs can
+	 * connect to it instead of re-deriving a name nobody bound (#4376 family).
+	 *
+	 * Published, not derived: a Gentle Shell child gets `mkdtemp` under the
+	 * inherited tmp root, so the reader's derivation names a path in ITS tmp
+	 * root, which is not where the incumbent listens. Absent when the host bound
+	 * nothing (warm attach is opt-in) and on every entry written before the
+	 * field, which is why a reader treats absent as "derive, as before".
+	 */
+	diagnosticsEndpoint?: string;
 	rssBytes: number;
 	/** Host process CPU percent, sampled at the same heartbeat cadence as
 	 *  `rssBytes` (#620). `undefined` when sampling failed/unavailable (e.g.
@@ -194,6 +207,50 @@ interface RegistryFile {
 
 function registryPath(): string {
 	return path.join(getGlobalPiLensDir(), "instances.json");
+}
+
+/**
+ * The endpoint THIS process bound, held once per process: the value every
+ * writer of this process's own entry stamps, so an entry rebuilt from scratch
+ * (`registerInstanceNow`, a synthesized `recordLspChild` host) cannot drop a
+ * field the process still holds. Written by `clients/warm-attach.ts` at bind
+ * time through {@link publishDiagnosticsEndpoint} — that module owns the bind,
+ * this one owns the record.
+ *
+ * A cell, not a second store: nothing reads it back as an answer. The published
+ * copy in `instances.json` is the only thing a peer sees.
+ */
+const DIAGNOSTICS_ENDPOINT_FAMILY = "instance-registry.diagnostics-endpoint";
+/** Bump when the cell's shape changes. */
+const DIAGNOSTICS_ENDPOINT_VERSION = 1;
+
+function diagnosticsEndpointCell(): { endpoint: string | undefined } {
+	return getProcessSingleton(
+		DIAGNOSTICS_ENDPOINT_FAMILY,
+		DIAGNOSTICS_ENDPOINT_VERSION,
+		() => ({ endpoint: undefined as string | undefined }),
+	);
+}
+
+/**
+ * Publish the diagnostics endpoint this process bound, or `undefined` when it
+ * bound none (warm attach off, a rebind in progress, or a listener that failed
+ * to bind). Every entry this process writes afterwards carries it.
+ */
+export function publishDiagnosticsEndpoint(endpoint: string | undefined): void {
+	diagnosticsEndpointCell().endpoint = endpoint;
+}
+
+/**
+ * The published fields for this process's own entry: the endpoint as a single
+ * optional member, so a writer spreads it and an unpublished process writes no
+ * key at all (a present-but-empty field would read as a malformed path).
+ */
+function diagnosticsEndpointFields(): { diagnosticsEndpoint?: string } {
+	const endpoint = diagnosticsEndpointCell().endpoint;
+	return typeof endpoint === "string" && endpoint.length > 0
+		? { diagnosticsEndpoint: endpoint }
+		: {};
 }
 
 /**
@@ -612,6 +669,7 @@ async function registerInstanceNow(
 				lspChildCount: existing?.lspChildren?.length ?? 0,
 				rssBytes: process.memoryUsage().rss,
 				heartbeatAt: now,
+				...diagnosticsEndpointFields(),
 				...(subagent ? { subagent } : {}),
 			});
 			return { instances: others };
@@ -963,6 +1021,7 @@ async function recordLspChildNow(
 					lspChildCount: 1,
 					rssBytes: process.memoryUsage().rss,
 					heartbeatAt: now,
+					...diagnosticsEndpointFields(),
 					...(hostIdentity
 						? {
 								subagent: {

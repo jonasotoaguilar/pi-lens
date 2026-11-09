@@ -285,7 +285,8 @@ function notifyStartupWarmSkip(args: {
 
 /**
  * #713 corrected: decide, at the session boundary, whether this subagent's own
- * project root is already served by a live peer's auxiliary LSP fleet.
+ * project root is already served by a live peer's auxiliary LSP fleet AND
+ * whether this process reads that fleet's answers.
  *
  * The auxiliary gate (`clients/dispatch/auxiliary-lsp.ts`) reads the answer
  * synchronously on every dispatch, so the registry read has to happen here —
@@ -294,6 +295,17 @@ function notifyStartupWarmSkip(args: {
  * read enables the fleet, which is the safe direction. The module is imported
  * lazily for the same reason `clients/dispatch/fact-store.js` is: only a
  * subagent session pays for loading it.
+ *
+ * Ordering: `index.ts` awaits `configureWarmAttach` before it calls
+ * `handleSessionStart`, so the attachment this probe reads exists by the time it
+ * runs. That order is a host detail, not a contract this file can enforce, so
+ * the probe publishes a CANDIDATE and the gate re-validates it on every read
+ * (root, attachment, incumbent liveness). A host with another order — the MCP
+ * adapter never configures warm attach — therefore leaves a child with no
+ * attachment, and its fleet runs, instead of skipping on a premise nobody
+ * holds. Deciding the whole question lazily on first dispatch was the
+ * alternative and was rejected: it would give every short-lived child at least
+ * one fleet spawn, which is the entire population this skip exists for.
  */
 function probeSubagentAuxiliaryPeerCoverage(args: {
 	root: string;
@@ -313,7 +325,7 @@ function probeSubagentAuxiliaryPeerCoverage(args: {
 			args.dbg(
 				covered
 					? `session_start subagent auxiliaries: deferred to a live peer on ${args.root}`
-					: `session_start subagent auxiliaries: enabled, no live peer covers ${args.root}`,
+					: `session_start subagent auxiliaries: enabled, no attached peer fleet covers ${args.root}`,
 			);
 		})
 		.catch(() => {
@@ -3067,11 +3079,12 @@ export async function handleSessionStart(
 		// best-effort lifecycle cleanup — never fail session_start
 	});
 	// #713 corrected: light mode's auxiliary skip is only sound when a live peer
-	// already runs that fleet over THIS session's own root, so the skip is
-	// decided here — at the session boundary, like the machine-wide LSP budget
-	// degrade — and the synchronous dispatch gate reads the cached answer. A
-	// delegated child in another worktree or repository has no such peer and
-	// keeps its own fleet.
+	// already runs that fleet over THIS session's own root AND this process is
+	// warm-attached to it, so the skip is decided here — at the session boundary,
+	// like the machine-wide LSP budget degrade — and the synchronous dispatch gate
+	// re-validates the cached answer on every read. A delegated child in another
+	// worktree or repository, a child with warm attach off, and a child whose
+	// incumbent went away all keep their own fleet.
 	//
 	// Placed BEFORE the quick-mode return on purpose: the gate is consulted on
 	// every dispatch whatever the startup mode, and a fresh child `pi`'s FIRST

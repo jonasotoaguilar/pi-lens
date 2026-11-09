@@ -16,7 +16,11 @@
  *     what protects concurrent secondaries, which never reach
  *     `handleSessionStart` at all (the #473 guard in index.ts) and
  *     therefore never schedule a warmup of their own;
- *   - subagent light-mode sessions skip the pre-warm (#449);
+ *   - subagent light-mode sessions skip the pre-warm (#449), including a
+ *     detected Gentle Shell child (`GENTLE_PI_AGENTS_CHILD=1`) on a
+ *     `pi --mode rpc` invocation, which `isPrintMode()` does NOT match (it
+ *     reads only `--print`/`-p`), so that child's warmup still arms and runs
+ *     its walks while the spawned pre-warm stays skipped;
  *   - the no-lsp and no-lens flags skip the pre-warm.
  */
 
@@ -149,6 +153,8 @@ describe("quick-mode warmup LSP pre-warm (#947)", () => {
 		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = previousDataDir;
 		delete process.env.PI_SUBAGENT_CHILD;
+		delete process.env.GENTLE_PI_AGENTS_CHILD;
+		delete process.env.PI_LENS_SUBAGENT_FULL;
 		_resetSubagentModeForTests();
 	});
 
@@ -377,4 +383,106 @@ describe("quick-mode warmup LSP pre-warm (#947)", () => {
 			}
 		},
 	);
+
+	// D3 (Gentle Shell audit): a `pi --mode rpc` child is NOT print mode —
+	// `isPrintMode()` matches only `--print`/`-p` — so the quick-mode warmup
+	// timer still arms for a detected subagent child and the pass still runs.
+	// What the marker does stop is the half that retains a resource: the
+	// dominant-language LSP pre-warm skips on `isSubagentSession()`. The two
+	// cases below pin that split for the Gentle Shell vocabulary specifically
+	// (`GENTLE_PI_AGENTS_CHILD=1`), which the `PI_SUBAGENT_CHILD` case above
+	// does not reach.
+	const rpcLikeArgv = (): string[] => [
+		...process.argv.filter((arg) => arg !== "--print" && arg !== "-p"),
+		"--mode",
+		"rpc",
+	];
+
+	const warmupPhaseLogged = (phase: string): boolean =>
+		logLatencySpy.mock.calls.some(
+			([record]) => (record as { phase?: string }).phase === phase,
+		);
+
+	it("arms the warmup but never pre-warms LSP for a detected Gentle Shell rpc child (D3)", async () => {
+		const env = setupTestEnvironment("pi-lens-warmup-prewarm-gentle-");
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		_resetSubagentModeForTests();
+		const prevArgv = process.argv;
+		process.argv = rpcLikeArgv();
+		const dbgLog: string[] = [];
+		try {
+			const cwd = makeWarmableProject(env);
+			await handleSessionStart(
+				makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }),
+			);
+
+			await vi.waitFor(
+				() => {
+					expect(warmupPhaseLogged("warmup_total")).toBe(true);
+				},
+				{ timeout: 10_000 },
+			);
+			// The pass the one-shot print gate does NOT skip for this vocabulary:
+			// the scan-context verdict, the language-profile walk, and the index
+			// build all still run, off the hot path inside the unref'd timer.
+			expect(warmupPhaseLogged("warmup_scan_context")).toBe(true);
+			expect(warmupPhaseLogged("warmup_language_profile")).toBe(true);
+			expect(warmupPhaseLogged("warmup_word_index")).toBe(true);
+			// The spawned-resource half: no pre-warm phase, no dominant-language
+			// touch, and the guard's own reason on the debug stream.
+			expect(warmupPhaseLogged("warmup_lsp_prewarm")).toBe(false);
+			expect(
+				touchFileSpy.mock.calls.some(
+					([, , opts]) =>
+						(opts as { source?: string })?.source === "startup-warm-dominant",
+				),
+			).toBe(false);
+			expect(dbgLog).toContainEqual(
+				expect.stringContaining(
+					"warmup: skipping LSP pre-warm (subagent session)",
+				),
+			);
+		} finally {
+			process.argv = prevArgv;
+			await waitForProjectSnapshotPersistsForTests();
+			env.cleanup();
+		}
+	});
+
+	it("warms exactly like the interactive path for the same rpc invocation without the marker", async () => {
+		const env = setupTestEnvironment("pi-lens-warmup-prewarm-rpc-");
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const prevArgv = process.argv;
+		process.argv = rpcLikeArgv();
+		const dbgLog: string[] = [];
+		try {
+			const cwd = makeWarmableProject(env);
+			await handleSessionStart(
+				makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }),
+			);
+
+			await vi.waitFor(
+				() => {
+					expect(warmupPhaseLogged("warmup_total")).toBe(true);
+				},
+				{ timeout: 10_000 },
+			);
+			// `--mode rpc` alone changes nothing: the pre-warm spawns, which is
+			// exactly what a detected subagent child is spared.
+			expect(
+				touchFileSpy.mock.calls.some(
+					([, , opts]) =>
+						(opts as { source?: string })?.source === "startup-warm-dominant",
+				),
+			).toBe(true);
+			expect(dbgLog).not.toContainEqual(
+				expect.stringContaining("skipping LSP pre-warm"),
+			);
+		} finally {
+			process.argv = prevArgv;
+			await waitForProjectSnapshotPersistsForTests();
+			env.cleanup();
+		}
+	});
 });

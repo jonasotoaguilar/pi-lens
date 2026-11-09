@@ -32,7 +32,9 @@ import {
 	releaseOncePerSessionPhase,
 } from "../latency-logger.js";
 import { realIsPidAlive } from "../pid-liveness.js";
+import { normalizeFilePath } from "../path-utils.js";
 import { isSubagentSession } from "../subagent-mode.js";
+import { warmAttachAttachment } from "../warm-attach.js";
 import type { FileRole } from "../file-role.js";
 import { findLocalOpengrepConfig } from "../opengrep-config.js";
 import { findLocalTyposConfig } from "../typos-config.js";
@@ -300,35 +302,115 @@ export type GetFlag = (flag: string) => boolean | string | undefined;
 
 /**
  * #713 corrected: whether a live peer instance ALREADY runs the auxiliary
- * fleet over this session's own project root. See
- * {@link refreshSubagentAuxiliaryPeerCoverage} for the probe and
- * {@link enabledAuxiliaryLspServerIds} for the gate that reads this.
+ * fleet over this session's own project root AND this session reads its answers
+ * from there. See {@link refreshSubagentAuxiliaryPeerCoverage} for the probe,
+ * {@link subagentAuxiliaryFleetDeferredToPeer} for the premise re-check every
+ * read performs, and {@link enabledAuxiliaryLspServerIds} for the gate that
+ * reads this.
  */
 const PEER_COVERAGE_PHASE = "subagent_auxiliary_peer_coverage";
+const PEER_REARM_PHASE = "subagent_auxiliary_peer_coverage_rearmed";
 
 /**
  * One session-boundary answer, cached for the dispatch gate the same way the
- * LSP budget degrade caches its decision (`clients/lsp-budget.ts`). Absent
- * means "not asked yet", which reads as NOT covered: every unknown fails
- * toward ENABLING the fleet, never toward a silently empty scan.
+ * LSP budget degrade caches its decision (`clients/lsp-budget.ts`).
+ *
+ * The ROOT is part of the answer, not context around it (#713 review A1): a
+ * process that holds two roots and caches one bare boolean answers for the root
+ * it did not measure. Absent means "not asked yet", which reads as NOT covered:
+ * every unknown fails toward ENABLING the fleet, never toward a silently empty
+ * scan.
  */
-let peerCoverage: { root: string; covered: boolean } | undefined;
+interface AuxiliaryPeerCoverageDecision {
+	/** The session root this answer was computed for. */
+	root: string;
+	/** `root` in the identity form the read comparison uses, normalized once
+	 *  here: this decision is read once per dispatched file, and every
+	 *  `normalizeFilePath` call is a realpath (measured ~3.1 us on this repo). */
+	rootKey: string;
+	/** True only while both premises held: a live same-root peer AND an
+	 *  attachment to it. Re-armed to `false` when a read finds them broken. */
+	covered: boolean;
+	/** The incumbent warm attach read from when the decision was taken. */
+	incumbentPid: number | undefined;
+	peerCount: number;
+}
 
-/** True only when a same-root live peer was confirmed for this session. */
+let peerCoverage: AuxiliaryPeerCoverageDecision | undefined;
+
+/**
+ * True only while a same-root live peer was confirmed for this session AND the
+ * attachment that premise rests on still holds.
+ *
+ * The premise is re-checked HERE, on every read, rather than trusted from the
+ * session boundary that measured it: warm attach is configured for one root and
+ * can attach to a different incumbent (or drop to local) afterwards, and a
+ * cached verdict that outlived that is a skip whose premise is false again. A
+ * read that finds any premise broken re-arms the decision to ENABLED — once,
+ * permanently for this session, with one bounded record — so the session can
+ * flip from skip to enable and never back.
+ *
+ * Cheap by construction: only a COVERED decision reaches the accessor and the
+ * liveness probe (`process.kill(pid, 0)`, the shared pid check), and a session
+ * that never skipped pays nothing here.
+ */
 export function subagentAuxiliaryFleetDeferredToPeer(): boolean {
-	return peerCoverage?.covered === true;
+	const decision = peerCoverage;
+	if (decision === undefined || !decision.covered) return false;
+	const broken = brokenPremise(decision);
+	if (broken === undefined) return true;
+	decision.covered = false;
+	recordPeerCoverageRearm(decision, broken);
+	return false;
+}
+
+/** Which premise stopped holding, or `undefined` while both still do. */
+function brokenPremise(
+	decision: AuxiliaryPeerCoverageDecision,
+): string | undefined {
+	const attached = warmAttachAttachment();
+	if (attached === undefined) return "detached";
+	if (normalizeFilePath(attached.root) !== decision.rootKey)
+		return "root-mismatch";
+	if (attached.incumbentPid !== decision.incumbentPid)
+		return "incumbent-changed";
+	if (!realIsPidAlive(attached.incumbentPid)) return "incumbent-exited";
+	return undefined;
+}
+
+/** The transition record: one row per session root, claimed before the payload
+ *  is built so repeated reads cannot add a second. */
+function recordPeerCoverageRearm(
+	decision: AuxiliaryPeerCoverageDecision,
+	reason: string,
+): void {
+	if (!claimPhaseOncePerSession(PEER_REARM_PHASE, decision.root)) return;
+	logLatency({
+		type: "phase",
+		phase: "subagent_auxiliary_peer_coverage_rearmed",
+		filePath: decision.root,
+		durationMs: 0,
+		metadata: {
+			reason,
+			peerCount: decision.peerCount,
+			incumbentPid: decision.incumbentPid,
+		},
+	});
 }
 
 /** Test-only: re-arm the session-scoped decision and its once-per-session
- *  record claim, matching the `_reset…ForTests` convention. */
+ *  record claims, matching the `_reset…ForTests` convention. */
 export function _resetSubagentAuxiliaryPeerCoverageForTests(): void {
 	peerCoverage = undefined;
 	releaseOncePerSessionPhase(PEER_COVERAGE_PHASE);
+	releaseOncePerSessionPhase(PEER_REARM_PHASE);
 }
 
 export interface SubagentPeerCoverageProbe {
 	/** This session's own project root — the one `registerInstance` records for
-	 *  it, so a peer answer is comparable to this session's own registration. */
+	 *  it, so a peer answer is comparable to this session's own registration.
+	 *  It is also compared against the root warm attach is attached for, so a
+	 *  decision can never answer for a root it did not measure. */
 	root: string;
 	/** A pre-read registry snapshot, for callers (and tests) that already hold
 	 *  one. Omitted => the one registry read this probe performs. */
@@ -364,8 +446,9 @@ function authoritativeRootEntries(
 
 /**
  * Session-boundary probe: does a LIVE peer serve this session's own project
- * root? `clients/lsp-budget.ts`'s degrade decision answers the same shape for
- * the machine-wide budget; this one answers for the subagent auxiliary skip.
+ * root, and is this session attached to that peer's fleet? `clients/lsp-
+ * budget.ts`'s degrade decision answers the same shape for the machine-wide
+ * budget; this one answers for the subagent auxiliary skip.
  *
  * The skip it feeds assumed the parent session runs those servers on the same
  * cwd. That holds for an in-place fan-out and fails for both delegated
@@ -375,11 +458,24 @@ function authoritativeRootEntries(
  * identity. A child there inherited a skip whose premise was false and lost
  * opengrep/ast-grep/typos/zizmor coverage of a tree no peer scanned.
  *
+ * A registered peer is only half of that premise: the child obtains nothing
+ * from a fleet it is not attached to, so both facts are required, and the
+ * attached incumbent must be the live peer registered on THIS root — the
+ * instance Warm attach selected from the same registry.
+ *
  * Awaitable but never required to be awaited by the host — the caller
  * (`clients/runtime-session.ts`) fires it, because a registry read must not
  * delay `session_start`. Dispatch happens later in the turn, so the cache is
  * populated before its first read in practice; a turn that beats the read
  * enables the fleet, the safe direction.
+ *
+ * The answer this publishes is a CANDIDATE, not a final verdict: the host's
+ * only guarantee about ordering is that `configureWarmAttach` is awaited before
+ * `handleSessionStart` in `index.ts`, and a different adapter that never
+ * configures warm attach has no attachment to rely on. So the decision is
+ * re-validated when it is read (`subagentAuxiliaryFleetDeferredToPeer`), which
+ * makes a wrong or missing ordering fail toward ENABLING instead of skipping on
+ * a premise nobody holds.
  *
  * Never throws: an unreadable registry, a torn snapshot or a throwing
  * comparator leaves the answer at NOT covered (enable).
@@ -396,15 +492,30 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
 	try {
 		const entries = probe.entries ?? (await readInstanceRegistry());
 		if (probe.isCurrent !== undefined && !probe.isCurrent()) return false;
+		const isPidAlive = probe.isPidAlive ?? realIsPidAlive;
 		const peers = selectLivePeerInstances(
 			authoritativeRootEntries(entries),
 			probe.root,
 			probe.now,
-			probe.isPidAlive ?? realIsPidAlive,
+			isPidAlive,
 			"exact",
 		);
-		const covered = peers.length > 0;
-		peerCoverage = { root: probe.root, covered };
+		const attached = warmAttachAttachment();
+		const rootKey = normalizeFilePath(probe.root);
+		const attachedRootMatches =
+			attached !== undefined && normalizeFilePath(attached.root) === rootKey;
+		const attachedPeer =
+			attached !== undefined && attachedRootMatches
+				? peers.find((peer) => peer.pid === attached.incumbentPid)
+				: undefined;
+		const covered = attachedPeer !== undefined;
+		peerCoverage = {
+			root: probe.root,
+			rootKey,
+			covered,
+			incumbentPid: attachedPeer?.pid,
+			peerCount: peers.length,
+		};
 		// One row per session root, claimed before the payload is built: a
 		// re-fired session start for the same root cannot add a second row.
 		if (claimPhaseOncePerSession(PEER_COVERAGE_PHASE, probe.root)) {
@@ -417,6 +528,9 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
 					peerCovered: covered,
 					peerCount: peers.length,
 					registryEntries: entries.length,
+					attached: attached !== undefined,
+					attachedRootMatches,
+					attachedIncumbentPid: attached?.incumbentPid,
 				},
 			});
 		}
@@ -424,7 +538,13 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
 	} catch {
 		// Best-effort, like every other registry consumer: an unanswered coverage
 		// question must never read as covered.
-		peerCoverage = { root: probe.root, covered: false };
+		peerCoverage = {
+			root: probe.root,
+			rootKey: normalizeFilePath(probe.root),
+			covered: false,
+			incumbentPid: undefined,
+			peerCount: 0,
+		};
 		return false;
 	}
 }
@@ -433,18 +553,22 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
  *  to `touchFile` since it — not the LSP service — owns flag access).
  *
  * #449 slice 2 (prototype): when this process decided at `session_start` that
- * the machine-wide LSP budget is exceeded (`clients/lsp-budget.ts`), auxiliary
- * servers are skipped entirely for the rest of the session — the primary
+ * the LSP budget is exceeded (`clients/lsp-budget.ts`: a session degrades when
+ * its own project root is over its share or the machine-wide stop trips),
+ * auxiliary servers are skipped entirely for the rest of the session — the primary
  * language server per file is unaffected. This is a per-SESSION degrade, not
  * per-file: once over budget, this session never spawns its auxiliary fleet,
  * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
-	// #449 slice 2 (budget): skip auxiliaries when machine-wide LSP budget is
-	// exceeded. #713 (subagent light mode): reuse the same seam, but only under
-	// REAL peer coverage of this session's own root
-	// (`refreshSubagentAuxiliaryPeerCoverage`) — a delegated child in another
-	// worktree or repository has no peer scanning its tree, so it runs the fleet
-	// itself. PI_LENS_SUBAGENT_FULL=1 still restores full behavior via
+	// #449 slice 2 (budget): skip auxiliaries when this session's own root is
+	// over its LSP share, or the machine-wide stop trips.
+	// exceeded. #713 (subagent light mode): reuse the same seam, but only while
+	// BOTH premises hold — a live peer on this session's own root and an
+	// attachment to its fleet (`refreshSubagentAuxiliaryPeerCoverage` publishes
+	// the candidate, `subagentAuxiliaryFleetDeferredToPeer` re-validates it on
+	// this read). A delegated child in another worktree or repository, or any
+	// child that is not warm-attached, has no fleet reading its tree, so it runs
+	// the fleet itself. PI_LENS_SUBAGENT_FULL=1 still restores full behavior via
 	// isSubagentSession() returning false.
 	if (shouldDegradeAuxiliaryLsp()) return [];
 	if (isSubagentSession() && subagentAuxiliaryFleetDeferredToPeer()) return [];

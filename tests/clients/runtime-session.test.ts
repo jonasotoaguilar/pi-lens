@@ -39,6 +39,10 @@ import { normalizeFilePath } from "../../clients/path-utils.js";
 import { _resetSlowFsForTests } from "../../clients/slow-fs.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
 import {
+	_resetWarmAttachForTests,
+	_setWarmAttachForTests,
+} from "../../clients/warm-attach.js";
+import {
 	createTempFile,
 	setupTestEnvironment,
 	useTrackedTempDirs,
@@ -1284,10 +1288,12 @@ describe(
 
 		it("subagent light mode asks the peer-coverage probe at the session boundary (#713)", async () => {
 			// #713 corrected: the auxiliary skip is only sound when a live peer
-			// serves THIS session's own root, so `handleSessionStart` has to fire the
-			// probe. A fabricated LIVE peer on this fixture's root is the one input
-			// that can publish the deferred decision: nothing else in this process
-			// writes it, so a removed call leaves every assertion below red.
+			// serves THIS session's own root AND warm attach reads from it, so
+			// `handleSessionStart` has to fire the probe. A fabricated LIVE peer on
+			// this fixture's root plus warm attach's own attached-state seam are the
+			// only inputs that can publish the deferred decision: nothing else in
+			// this process writes it, so a removed call leaves every assertion below
+			// red.
 			const registryFile = path.join(getGlobalPiLensDir(), "instances.json");
 			const previousRegistry = fs.existsSync(registryFile)
 				? fs.readFileSync(registryFile, "utf8")
@@ -1301,6 +1307,7 @@ describe(
 				// short-lived agent the skip exists for.
 				const { env, dbg } = await runSessionStart("quick", (tmpDir) => {
 					const root = normalizeFilePath(tmpDir);
+					_setWarmAttachForTests(root, process.ppid);
 					fs.writeFileSync(
 						registryFile,
 						JSON.stringify({
@@ -1350,6 +1357,73 @@ describe(
 				delete process.env.PI_SUBAGENT_CHILD;
 				_resetSubagentModeForTests();
 				_resetSubagentAuxiliaryPeerCoverageForTests();
+				_resetWarmAttachForTests();
+			}
+		});
+
+		it("subagent light mode keeps its own auxiliary fleet when no incumbent is attached (#713)", async () => {
+			// The other direction of the same call site: the peer exists and this
+			// process is not attached to it, so the probe must not publish a skip —
+			// a registered peer this session cannot read from covers nothing.
+			const registryFile = path.join(getGlobalPiLensDir(), "instances.json");
+			const previousRegistry = fs.existsSync(registryFile)
+				? fs.readFileSync(registryFile, "utf8")
+				: undefined;
+			_resetSubagentAuxiliaryPeerCoverageForTests();
+			_resetWarmAttachForTests();
+			process.env.PI_SUBAGENT_CHILD = "1";
+			_resetSubagentModeForTests();
+			try {
+				const { env, dbg } = await runSessionStart("quick", (tmpDir) => {
+					const root = normalizeFilePath(tmpDir);
+					fs.writeFileSync(
+						registryFile,
+						JSON.stringify({
+							instances: [
+								{
+									pid: process.ppid,
+									startedAt: new Date(Date.now() - 60_000).toISOString(),
+									projectRoot: root,
+									projectRoots: [root],
+									lspChildren: [],
+									lspChildCount: 0,
+									rssBytes: 0,
+									heartbeatAt: new Date().toISOString(),
+								},
+							],
+						}),
+					);
+				});
+				try {
+					// Wait for the probe's own record before asserting: the registry read
+					// is asynchronous, so the absence of a decision proves nothing until
+					// the probe has published one.
+					await vi.waitFor(
+						() =>
+							expect(
+								dbg.mock.calls.some(([msg]) =>
+									String(msg).includes("subagent auxiliaries: enabled"),
+								),
+							).toBe(true),
+						{ timeout: HEAVY_IO_TIMEOUT_MS },
+					);
+					expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+					expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
+						"opengrep",
+					);
+				} finally {
+					await env.cleanup();
+				}
+			} finally {
+				if (previousRegistry === undefined) {
+					fs.rmSync(registryFile, { force: true });
+				} else {
+					fs.writeFileSync(registryFile, previousRegistry);
+				}
+				delete process.env.PI_SUBAGENT_CHILD;
+				_resetSubagentModeForTests();
+				_resetSubagentAuxiliaryPeerCoverageForTests();
+				_resetWarmAttachForTests();
 			}
 		});
 

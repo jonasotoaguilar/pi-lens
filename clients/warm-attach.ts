@@ -2,6 +2,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import {
 	type InstanceEntry,
+	publishDiagnosticsEndpoint,
 	readInstanceRegistry,
 	selectLivePeerInstances,
 } from "./instance-registry.js";
@@ -18,9 +19,11 @@ import {
 } from "./lsp/tsserver-sync.js";
 import { loadLspService } from "./lsp-lazy.js";
 import {
+	boundUnixSocketPath,
 	contentHash,
 	createWarmIpcLineReader,
 	diagnosticsIpcPathForCwd,
+	peerDiagnosticsEndpoint,
 	requestWarmCodeActions,
 	requestWarmDiagnostics,
 	unlinkStaleUnixSocket,
@@ -42,6 +45,13 @@ import { normalizeFilePath } from "./path-utils.js";
 interface AttachState {
 	cwd?: string;
 	incumbentPid?: number;
+	/**
+	 * The endpoint the incumbent PUBLISHED in its registry entry, if any. Read
+	 * from the same entry that supplies `incumbentPid`, so the two cannot
+	 * describe different registrations; `undefined` means the peer predates the
+	 * field and the derived name is used, exactly as before.
+	 */
+	incumbentEndpoint?: string;
 	local: boolean;
 	server?: net.Server;
 	servedDiagnosticHashes: Map<string, string>;
@@ -338,16 +348,27 @@ function startServer(cwd: string): void {
 	});
 	server.on("error", (error) => {
 		record("listener-error", cwd, String(error));
+		// Nothing is listening, so nothing is published: a peer must fall back to
+		// its own derivation rather than dial a name this process never bound.
+		publishDiagnosticsEndpoint(undefined);
 	});
 	server.listen(endpoint);
 	server.unref();
 	state.server = server;
+	// The name the OS accepts for this listener, cut once here rather than
+	// recomputed by every reader (#4353). A peer whose `os.tmpdir()` differs —
+	// every Gentle Shell child — reads it from this process's registry entry.
+	publishDiagnosticsEndpoint(boundUnixSocketPath(endpoint));
 }
 
 export async function configureWarmAttach(cwd: string): Promise<void> {
 	state.cwd = path.resolve(cwd);
 	state.incumbentPid = undefined;
+	state.incumbentEndpoint = undefined;
 	state.local = true;
+	// Before the opt-in check: a session that binds nothing (opt-in off, a rebind
+	// that fails) publishes nothing, so a child of it falls back to derivation.
+	publishDiagnosticsEndpoint(undefined);
 	if (process.env.PI_LENS_WARM_ATTACH !== "1") {
 		record("disabled", state.cwd, "opt-in-not-enabled");
 		return;
@@ -362,6 +383,7 @@ export async function configureWarmAttach(cwd: string): Promise<void> {
 		return;
 	}
 	state.incumbentPid = incumbent.pid;
+	state.incumbentEndpoint = incumbent.diagnosticsEndpoint;
 	state.local = false;
 	record("attached", state.cwd, undefined, incumbent.pid);
 }
@@ -379,12 +401,21 @@ export async function tryWarmAttachedDiagnostics(
 		promoteToLocal("incumbent-stale-or-exited");
 		return undefined;
 	}
+	// Re-read from the entry that just answered, so a peer that rebound since the
+	// session boundary is followed rather than dialed at its previous name.
+	state.incumbentEndpoint = incumbent.diagnosticsEndpoint;
+	const endpoint = peerDiagnosticsEndpoint(
+		state.cwd,
+		state.incumbentPid,
+		state.incumbentEndpoint,
+	);
 	const result = await requestWarmDiagnostics(
 		state.cwd,
 		state.incumbentPid,
 		file,
 		content,
 		timeoutMs,
+		state.incumbentEndpoint,
 	);
 	if (!result.available) {
 		// #3255 H1: a confirmed-alive incumbent whose endpoint has no listener is
@@ -397,9 +428,9 @@ export async function tryWarmAttachedDiagnostics(
 		if (result.reason === "no-listener") {
 			recordDegradationOnce({
 				kind: "warm-ipc-endpoint-missing",
-				subject: diagnosticsIpcPathForCwd(state.cwd, state.incumbentPid),
+				subject: endpoint,
 				reason:
-					"the registry confirms this incumbent is alive but nothing is listening on its derived endpoint — if pi-lens was upgraded while it was running, restart it",
+					"the registry confirms this incumbent is alive but nothing is listening on its endpoint — if pi-lens was upgraded while it was running, restart it",
 			});
 		}
 		promoteToLocal(result.reason);
@@ -423,6 +454,7 @@ export async function tryWarmAttachedCodeActions(
 		expectedContentHash,
 		ranges,
 		timeoutMs,
+		state.incumbentEndpoint,
 	);
 	if (result.available) {
 		record("code-actions-served", file, undefined, state.incumbentPid);
@@ -435,7 +467,35 @@ export async function tryWarmAttachedCodeActions(
 }
 
 export function isWarmAttached(): boolean {
-	return !state.local && state.incumbentPid !== undefined;
+	return warmAttachAttachment() !== undefined;
+}
+
+/**
+ * What this process is attached to. `isWarmAttached()` answers WHETHER this
+ * session reads another process's servers; a caller that needs to know which
+ * tree those answers describe has to ask for the root and the incumbent
+ * together (#713 review A1).
+ */
+export interface WarmAttachAttachment {
+	/** The root `configureWarmAttach` was called for, resolved as it stores it. */
+	root: string;
+	/** The instance whose servers answer this session's requests. */
+	incumbentPid: number;
+}
+
+/**
+ * The attachment this process holds, or `undefined` while it runs — and answers
+ * for — its own servers. The ONE reader of the attached state: `isWarmAttached`
+ * is this accessor's presence, so the two can never disagree.
+ */
+export function warmAttachAttachment(): WarmAttachAttachment | undefined {
+	if (
+		state.local ||
+		state.incumbentPid === undefined ||
+		state.cwd === undefined
+	)
+		return undefined;
+	return { root: state.cwd, incumbentPid: state.incumbentPid };
 }
 
 function promoteToLocal(reason: string): void {
@@ -443,6 +503,7 @@ function promoteToLocal(reason: string): void {
 	const pid = state.incumbentPid;
 	state.local = true;
 	state.incumbentPid = undefined;
+	state.incumbentEndpoint = undefined;
 	record("takeover", state.cwd ?? process.cwd(), reason, pid);
 }
 
@@ -451,8 +512,10 @@ export function _resetWarmAttachForTests(): void {
 	state.server = undefined;
 	state.cwd = undefined;
 	state.incumbentPid = undefined;
+	state.incumbentEndpoint = undefined;
 	state.local = true;
 	state.servedDiagnosticHashes.clear();
+	publishDiagnosticsEndpoint(undefined);
 }
 
 /**
@@ -471,9 +534,11 @@ export function _warmAttachServerForTests(): net.Server | undefined {
 export function _setWarmAttachForTests(
 	cwd: string,
 	incumbentPid: number,
+	incumbentEndpoint?: string,
 ): void {
 	state.cwd = path.resolve(cwd);
 	state.incumbentPid = incumbentPid;
+	state.incumbentEndpoint = incumbentEndpoint;
 	state.local = false;
 }
 

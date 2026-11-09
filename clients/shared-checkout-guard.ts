@@ -23,7 +23,8 @@
  *      see `WORKTREE_MUTATING_GIT_MATCHER`. The directory judged is the one
  *      the invocation TARGETS, which `-C` and `--work-tree` can move away
  *      from the caller's cwd.
- *   2. Another live pi-lens session is in the SAME WORKING TREE.
+ *   2. Another live pi-lens session is in the SAME WORKING TREE and is not a
+ *      sibling of this one in the subagent sense spelled out below.
  *      `selectLivePeerInstances` (clients/instance-registry.ts) owns liveness
  *      and is the single source of truth for it; warm-attach reads the same
  *      predicate in `"exact"` mode. Path containment alone is not identity
@@ -38,6 +39,31 @@
  * That ordering is the cost story: the two `git` probes run only after a
  * genuine worktree-mutating command in a genuinely shared checkout, which is
  * rare. Ordinary bash traffic pays one string classification.
+ *
+ * SUBAGENT SIBLINGS ARE NOT BLOCKERS (D1). An orchestrator that delegates
+ * several Gentle Shell children to ONE worktree makes those children live
+ * peers of each other, so a routine `git checkout` inside any of them was
+ * declined on the peers the orchestrator itself started. The exemption is
+ * one-directional and needs BOTH sides to be classified: this process is a
+ * detected subagent session (`isSubagentSession`, the single classifier, so
+ * `PI_LENS_SUBAGENT_FULL=1` restores the full guard) AND the peer's registry
+ * row carries the `subagent` field `registerInstance` stamps from that same
+ * classifier. A peer without it — a primary session, or a row written by a
+ * pi-lens that predates the field — still blocks, so a primary session keeps
+ * its protection from a child in both directions and an unrecognised peer
+ * fails toward refusal.
+ *
+ * The price is the child-to-child case: two children of one orchestrator can
+ * overwrite each other's uncommitted work. Accepted, because the work that
+ * becomes exposed is a delegated task's, visible immediately to the session
+ * that owns it and re-runnable, while the loss this guard was built for
+ * (#2007: an interactive session's three files, gone minutes apart and
+ * unrecoverable) still requires a live PRIMARY on the same tree to happen —
+ * which keeps blocking. The stricter reading, exempting only peers that share
+ * this child's `parentPid`, cannot serve the case the exemption exists for:
+ * the Gentle Shell vocabulary sets no parent-pid variable, so `subagent` on
+ * those rows carries a marker and nothing else. Every allow records
+ * `subagent_siblings_only` so the trade is readable in latency.log.
  *
  * UNKNOWN IS NOT CLEAN (catalog shape 10). When `git status` cannot answer,
  * the guard declines with its OWN reason rather than assuming the tree is
@@ -77,6 +103,7 @@ import { resolveGitToplevel } from "./opaque-mutation-scan.js";
 import { normalizeFilePath } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
+import { isSubagentSession } from "./subagent-mode.js";
 
 /** Verbs that rewrite tracked files unconditionally. */
 const ALWAYS_MUTATING_VERBS: ReadonlySet<string> = new Set([
@@ -258,6 +285,21 @@ function describePeers(peers: readonly InstanceEntry[]): string {
 }
 
 /**
+ * The peers whose uncommitted work actually gates this command.
+ *
+ * A subagent session's siblings are the peers the registry also stamps as
+ * subagents; `registerInstance` writes that field from `isSubagentSession()`,
+ * so both sides of this comparison are the one classification and no second
+ * availability answer exists to drift from it. For any other caller every
+ * peer stays a blocker, and for a subagent caller a peer without the field
+ * stays one too.
+ */
+function selectBlockingPeers(peers: readonly InstanceEntry[]): InstanceEntry[] {
+	if (!isSubagentSession()) return [...peers];
+	return peers.filter((peer) => peer.subagent === undefined);
+}
+
+/**
  * Decide whether one worktree-mutating git command may run here.
  *
  * Never throws: a registry read that fails yields an empty peer list, which
@@ -380,6 +422,11 @@ async function evaluateOneTarget(
 		logAllow(root, "no_peer_session");
 		return { block: false };
 	}
+	const blockingPeers = selectBlockingPeers(peers);
+	if (blockingPeers.length === 0) {
+		logAllow(root, "subagent_siblings_only");
+		return { block: false };
+	}
 	const state = await (deps.probeWorkingTree ?? probeWorkingTreeState)(cwd);
 	if (state === "clean") {
 		logAllow(root, "working_tree_clean");
@@ -392,7 +439,7 @@ async function evaluateOneTarget(
 			{
 				toolName: "shared-checkout-guard",
 				durationMs: 0,
-				metadata: { decision: "blocked", peerCount: peers.length },
+				metadata: { decision: "blocked", peerCount: blockingPeers.length },
 			},
 			{
 				ledgerKind: "shared-checkout-probe",
@@ -405,7 +452,7 @@ async function evaluateOneTarget(
 			unknown: true,
 			reason:
 				"🔴 WORKING-TREE CHANGE BLOCKED (--lens-checkout-guard): git could not report whether this checkout has uncommitted work, and it is shared with " +
-				`${describePeers(peers)}. Re-run the command once git answers, or take a dedicated git worktree.`,
+				`${describePeers(blockingPeers)}. Re-run the command once git answers, or take a dedicated git worktree.`,
 		};
 	}
 	emitBounded(
@@ -414,7 +461,7 @@ async function evaluateOneTarget(
 		{
 			toolName: "shared-checkout-guard",
 			durationMs: 0,
-			metadata: { decision: "blocked", peerCount: peers.length },
+			metadata: { decision: "blocked", peerCount: blockingPeers.length },
 		},
 		{
 			ledgerKind: "shared-checkout-wip",
@@ -426,7 +473,7 @@ async function evaluateOneTarget(
 		block: true,
 		reason:
 			"🔴 WORKING-TREE CHANGE BLOCKED (--lens-checkout-guard): this checkout has uncommitted changes and is shared with " +
-			`${describePeers(peers)}. The command would discard work that may not be yours. ` +
+			`${describePeers(blockingPeers)}. The command would discard work that may not be yours. ` +
 			"Commit the changes first, or run this in a dedicated git worktree.",
 	};
 }
