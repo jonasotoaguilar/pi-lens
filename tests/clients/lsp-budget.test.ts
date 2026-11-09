@@ -14,9 +14,12 @@ import {
 	decideLspBudget,
 	DEFAULT_LSP_BUDGET_CEILING,
 	DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS,
+	DEFAULT_LSP_BUDGET_MACHINE_HEADROOM,
+	DEFAULT_LSP_BUDGET_ROOT_CEILING,
 	getLspBudgetIdleTimeoutMs,
 	getLspBudgetRssCeilingBytes,
 	getLspBudgetCeiling,
+	getLspBudgetRootCeiling,
 	isCrossProcessBudgetEnabled,
 	_resetLspBudgetDecisionForTests,
 	shouldDegradeAuxiliaryLsp,
@@ -76,34 +79,36 @@ describe("decideLspBudget", () => {
 		const decision = decideLspBudget(
 			reg,
 			alivePids(1, 2, 100, 101, 102, 200, 201),
-			16,
+			{ ownRoots: ["/proj"] },
 		);
 
 		expect(decision.totalLiveLspServers).toBe(5);
+		expect(decision.ownRootLoad).toBe(5);
 		expect(decision.overBudget).toBe(false);
 		expect(decision.degradeAuxiliary).toBe(false);
 	});
 
-	it("at/over ceiling — over budget, aux degraded", () => {
+	it("at/over the root budget — over budget, aux degraded", () => {
 		const reg = [
 			instance({ pid: 1, lspChildren: childrenOfCount(10, "typescript", 100) }),
 			instance({ pid: 2, lspChildren: childrenOfCount(10, "pyright", 200) }),
 		];
-		const decision = decideLspBudget(reg, () => true, 16);
+		const decision = decideLspBudget(reg, () => true, { ownRoots: ["/proj"] });
 
 		expect(decision.totalLiveLspServers).toBe(20);
+		expect(decision.ownRootLoad).toBe(20);
 		expect(decision.overBudget).toBe(true);
 		expect(decision.degradeAuxiliary).toBe(true);
-		expect(decision.ceiling).toBe(16);
+		expect(decision.rootCeiling).toBe(DEFAULT_LSP_BUDGET_ROOT_CEILING);
 	});
 
-	it("exactly at ceiling counts as over budget (>=, not >)", () => {
+	it("exactly at the root budget counts as over budget (>=, not >)", () => {
 		const reg = [
 			instance({ pid: 1, lspChildren: childrenOfCount(16, "typescript", 100) }),
 		];
-		const decision = decideLspBudget(reg, () => true, 16);
+		const decision = decideLspBudget(reg, () => true, { ownRoots: ["/proj"] });
 
-		expect(decision.totalLiveLspServers).toBe(16);
+		expect(decision.ownRootLoad).toBe(16);
 		expect(decision.overBudget).toBe(true);
 	});
 
@@ -113,9 +118,12 @@ describe("decideLspBudget", () => {
 			instance({ pid: 2, lspChildren: childrenOfCount(2, "pyright", 300) }), // alive parent
 		];
 		// Only pid 2 is alive; pid 1's children don't count toward the total.
-		const decision = decideLspBudget(reg, alivePids(2), 16);
+		const decision = decideLspBudget(reg, alivePids(2), {
+			ownRoots: ["/proj"],
+		});
 
 		expect(decision.totalLiveLspServers).toBe(2);
+		expect(decision.ownRootLoad).toBe(2);
 		expect(decision.overBudget).toBe(false);
 	});
 
@@ -132,22 +140,16 @@ describe("decideLspBudget", () => {
 			pidNamespace: "pid:[container]",
 		});
 
-		const dead = decideLspBudget(
-			[foreign(7 * HOUR)],
-			() => true,
-			16,
-			undefined,
+		const dead = decideLspBudget([foreign(7 * HOUR)], () => true, {
+			ownRoots: ["/proj"],
 			now,
-			"pid:[own]",
-		);
-		const live = decideLspBudget(
-			[foreign(HOUR)],
-			() => false,
-			16,
-			undefined,
+			ownNamespace: "pid:[own]",
+		});
+		const live = decideLspBudget([foreign(HOUR)], () => false, {
+			ownRoots: ["/proj"],
 			now,
-			"pid:[own]",
-		);
+			ownNamespace: "pid:[own]",
+		});
 
 		expect(dead.totalLiveLspServers).toBe(0);
 		expect(dead.degradeAuxiliary).toBe(false);
@@ -166,17 +168,23 @@ describe("decideLspBudget", () => {
 		};
 
 		expect(
-			decideLspBudget([own], alivePids(2), 16, undefined, now, "pid:[own]")
-				.totalLiveLspServers,
+			decideLspBudget([own], alivePids(2), {
+				ownRoots: ["/proj"],
+				now,
+				ownNamespace: "pid:[own]",
+			}).totalLiveLspServers,
 		).toBe(3);
 		expect(
-			decideLspBudget([own], alivePids(), 16, undefined, now, "pid:[own]")
-				.totalLiveLspServers,
+			decideLspBudget([own], alivePids(), {
+				ownRoots: ["/proj"],
+				now,
+				ownNamespace: "pid:[own]",
+			}).totalLiveLspServers,
 		).toBe(0);
 	});
 
 	it("empty registry — zero load, never over budget", () => {
-		const decision = decideLspBudget([], () => true, 16);
+		const decision = decideLspBudget([], () => true);
 		expect(decision.totalLiveLspServers).toBe(0);
 		expect(decision.overBudget).toBe(false);
 		expect(decision.degradeAuxiliary).toBe(false);
@@ -192,13 +200,11 @@ describe("decideLspBudget", () => {
 				lspChildren: [lspChild({ pid: 100, rssBytes: 70 * 1024 * 1024 })],
 			}),
 		];
-		const decision = decideLspBudget(
-			reg,
-			() => true,
-			16,
-			100 * 1024 * 1024,
+		const decision = decideLspBudget(reg, () => true, {
+			ownRoots: ["/proj"],
+			rssCeilingBytes: 100 * 1024 * 1024,
 			now,
-		);
+		});
 
 		expect(decision.totalLiveLspServers).toBe(1);
 		expect(decision.totalRssBytes).toBe(110 * 1024 * 1024);
@@ -225,11 +231,187 @@ describe("decideLspBudget", () => {
 				}),
 			],
 		]) {
-			const decision = decideLspBudget(reg, () => true, 16, 1, now);
+			const decision = decideLspBudget(reg, () => true, {
+				rssCeilingBytes: 1,
+				now,
+			});
 			expect(decision.totalRssBytes).toBeUndefined();
 			expect(decision.rssPressure).toBe(false);
 			expect(decision.overBudget).toBe(false);
 		}
+	});
+});
+
+describe("per-root accounting (Gentle Shell fan-out)", () => {
+	const ROOT_A = "/worktrees/gentle-a";
+	const ROOT_B = "/worktrees/gentle-b";
+
+	function rootedInstance(
+		pid: number,
+		root: string,
+		childCount: number,
+		startPid: number,
+		overrides: Partial<InstanceEntry> = {},
+	): InstanceEntry {
+		return instance({
+			pid,
+			projectRoot: root,
+			projectRoots: [root],
+			lspChildren: childrenOfCount(childCount, "typescript", startPid),
+			lspChildCount: childCount,
+			...overrides,
+		});
+	}
+
+	it("degrades only the session whose own root is at its budget", () => {
+		const reg = [
+			rootedInstance(1, ROOT_A, 9, 100),
+			rootedInstance(2, ROOT_A, 8, 200),
+			rootedInstance(3, ROOT_B, 2, 300),
+		];
+
+		const hog = decideLspBudget(reg, () => true, { ownRoots: [ROOT_A] });
+		const peer = decideLspBudget(reg, () => true, { ownRoots: [ROOT_B] });
+
+		// Two hosts on ONE root sum to that root's load.
+		expect(hog.ownRootLoad).toBe(17);
+		expect(hog.ownRootOverBudget).toBe(true);
+		expect(hog.degradeAuxiliary).toBe(true);
+		expect(hog.shortenIdleTimeout).toBe(true);
+
+		expect(peer.totalLiveLspServers).toBe(19);
+		expect(peer.ownRootLoad).toBe(2);
+		expect(peer.ownRootOverBudget).toBe(false);
+		expect(peer.machineOverBudget).toBe(false);
+		expect(peer.overBudget).toBe(false);
+		expect(peer.degradeAuxiliary).toBe(false);
+	});
+
+	it("leaves a peer under its share alone when a fan-out of distinct roots exceeds the per-root budget machine-wide", () => {
+		// Eight Gentle Shell children in eight worktrees, three servers each:
+		// 24 live servers, every root well under its own budget.
+		const reg = Array.from({ length: 8 }, (_, i) =>
+			rootedInstance(10 + i, `/worktrees/fan-${i}`, 3, 1000 + i * 10),
+		);
+
+		const peer = decideLspBudget(reg, () => true, {
+			ownRoots: ["/worktrees/fan-3"],
+		});
+
+		// The old machine-global rule compared this total against one root's
+		// budget, so every session degraded.
+		expect(peer.totalLiveLspServers).toBe(24);
+		expect(peer.ceiling).toBe(DEFAULT_LSP_BUDGET_CEILING);
+		expect(peer.totalLiveLspServers >= peer.rootCeiling).toBe(true);
+		expect(peer.ownRootLoad).toBe(3);
+		expect(peer.ownRootOverBudget).toBe(false);
+		expect(peer.machineOverBudget).toBe(false);
+		expect(peer.overBudget).toBe(false);
+		expect(peer.degradeAuxiliary).toBe(false);
+		expect(peer.preferPullOnly).toBe(false);
+	});
+
+	it("still degrades on the machine-wide ceiling when the total is genuinely exceeded", () => {
+		// Five roots at 15 servers each: every root is under its own budget, the
+		// machine is not.
+		const reg = Array.from({ length: 5 }, (_, i) =>
+			rootedInstance(20 + i, `/worktrees/hot-${i}`, 15, 2000 + i * 20),
+		);
+
+		const decision = decideLspBudget(reg, () => true, {
+			ownRoots: ["/worktrees/hot-0"],
+		});
+
+		expect(decision.totalLiveLspServers).toBe(75);
+		expect(decision.ownRootLoad).toBe(15);
+		expect(decision.ownRootOverBudget).toBe(false);
+		expect(decision.machineOverBudget).toBe(true);
+		expect(decision.countOverBudget).toBe(true);
+		expect(decision.degradeAuxiliary).toBe(true);
+		expect(decision.shortenIdleTimeout).toBe(true);
+		expect(decision.preferPullOnly).toBe(true);
+	});
+
+	it("counts the machine ceiling as reached at equality (>=, not >)", () => {
+		const registry = [15, 15, 15, 15, 1, 1, 1, 1];
+		const reg = registry.map((count, i) =>
+			rootedInstance(40 + i, `/worktrees/edge-${i}`, count, 3000 + i * 20),
+		);
+
+		const decision = decideLspBudget(reg, () => true, {
+			ownRoots: ["/worktrees/edge-0"],
+		});
+
+		expect(decision.totalLiveLspServers).toBe(64);
+		expect(decision.machineOverBudget).toBe(true);
+		expect(decision.degradeAuxiliary).toBe(true);
+	});
+
+	it("keeps the pre-split verdict when one root is the whole machine", () => {
+		// The ordinary non-subagent case: exactly one live root, so the per-root
+		// budget and the old machine-wide number give the same answer.
+		const atBudget = decideLspBudget(
+			[rootedInstance(1, ROOT_A, 16, 100)],
+			() => true,
+			{ ownRoots: [ROOT_A] },
+		);
+		const under = decideLspBudget(
+			[rootedInstance(1, ROOT_A, 15, 100)],
+			() => true,
+			{ ownRoots: [ROOT_A] },
+		);
+
+		expect(atBudget.ownRootLoad).toBe(16);
+		expect(atBudget.degradeAuxiliary).toBe(true);
+		expect(under.ownRootLoad).toBe(15);
+		expect(under.degradeAuxiliary).toBe(false);
+	});
+
+	it("keeps the machine-wide rule at the per-root budget when the session cannot name its own root", () => {
+		const reg = [
+			rootedInstance(1, ROOT_A, 10, 100),
+			rootedInstance(2, ROOT_B, 10, 200),
+		];
+
+		const decision = decideLspBudget(reg, () => true, {});
+
+		expect(decision.ownRoots).toBeUndefined();
+		expect(decision.ownRootLoad).toBeUndefined();
+		expect(decision.ownRootOverBudget).toBe(false);
+		expect(decision.machineOverBudget).toBe(false);
+		expect(decision.countOverBudget).toBe(true);
+		expect(decision.degradeAuxiliary).toBe(true);
+	});
+
+	it("keeps RSS pressure machine-wide: a peer under its root budget degrades when aggregate RSS is over", () => {
+		const now = Date.parse("2026-11-02T12:00:00.000Z");
+		const heartbeatAt = new Date(now).toISOString();
+		const reg = [
+			rootedInstance(1, ROOT_A, 1, 100, {
+				heartbeatAt,
+				rssBytes: 200 * 1024 * 1024,
+				lspChildren: [lspChild({ pid: 100, rssBytes: 10 * 1024 * 1024 })],
+			}),
+			rootedInstance(2, ROOT_B, 2, 200, {
+				heartbeatAt,
+				rssBytes: 200 * 1024 * 1024,
+				lspChildren: [
+					lspChild({ pid: 200, rssBytes: 10 * 1024 * 1024 }),
+					lspChild({ pid: 201, rssBytes: 10 * 1024 * 1024 }),
+				],
+			}),
+		];
+
+		const decision = decideLspBudget(reg, () => true, {
+			ownRoots: [ROOT_A],
+			rssCeilingBytes: 100 * 1024 * 1024,
+			now,
+		});
+
+		expect(decision.ownRootOverBudget).toBe(false);
+		expect(decision.machineOverBudget).toBe(false);
+		expect(decision.rssPressure).toBe(true);
+		expect(decision.degradeAuxiliary).toBe(true);
 	});
 });
 
@@ -243,6 +425,19 @@ describe("getLspBudgetCeiling / isCrossProcessBudgetEnabled (env config)", () =>
 	it("defaults to DEFAULT_LSP_BUDGET_CEILING when unset", () => {
 		delete process.env.PI_LENS_LSP_BUDGET_CEILING;
 		expect(getLspBudgetCeiling()).toBe(DEFAULT_LSP_BUDGET_CEILING);
+	});
+
+	it("keeps the machine stop above one root's budget, and honors a root override", () => {
+		delete process.env.PI_LENS_LSP_BUDGET_CEILING;
+		delete process.env.PI_LENS_LSP_BUDGET_ROOT_CEILING;
+		expect(DEFAULT_LSP_BUDGET_CEILING).toBe(
+			DEFAULT_LSP_BUDGET_ROOT_CEILING * DEFAULT_LSP_BUDGET_MACHINE_HEADROOM,
+		);
+		expect(getLspBudgetRootCeiling()).toBe(DEFAULT_LSP_BUDGET_ROOT_CEILING);
+		process.env.PI_LENS_LSP_BUDGET_ROOT_CEILING = "4";
+		expect(getLspBudgetRootCeiling()).toBe(4);
+		process.env.PI_LENS_LSP_BUDGET_ROOT_CEILING = "0";
+		expect(getLspBudgetRootCeiling()).toBe(DEFAULT_LSP_BUDGET_ROOT_CEILING);
 	});
 
 	it("honors a valid positive override", () => {
@@ -292,6 +487,61 @@ describe("shouldDegradeAuxiliaryLsp (module-scope decision cache)", () => {
 
 	it("defaults to false before any check has run — fail toward today's behavior", () => {
 		expect(shouldDegradeAuxiliaryLsp()).toBe(false);
+	});
+
+	it("replaces the cached decision at every session-start check", async () => {
+		const previousRegistry = process.env.PI_LENS_INSTANCE_REGISTRY;
+		const previousBudget = process.env.PI_LENS_CROSS_PROCESS_BUDGET;
+		delete process.env.PI_LENS_INSTANCE_REGISTRY;
+		delete process.env.PI_LENS_CROSS_PROCESS_BUDGET;
+		_resetInstanceRegistryEnabledForTests();
+		try {
+			const root = "/worktrees/session-start";
+			const pressured = [
+				instance({
+					pid: process.pid,
+					projectRoot: root,
+					projectRoots: [root],
+					lspChildren: childrenOfCount(20, "typescript", 100),
+				}),
+			];
+			await checkCrossProcessLspBudget({
+				registry: pressured,
+				isPidAlive: () => true,
+				ownRoots: [root],
+			});
+			expect(shouldDegradeAuxiliaryLsp()).toBe(true);
+			expect(shouldPreferPullOnlyDiagnostics()).toBe(true);
+
+			const calm = [
+				instance({
+					pid: process.pid,
+					projectRoot: root,
+					projectRoots: [root],
+					lspChildren: childrenOfCount(1, "typescript", 100),
+				}),
+			];
+			await checkCrossProcessLspBudget({
+				registry: calm,
+				isPidAlive: () => true,
+				ownRoots: [root],
+			});
+			expect(shouldDegradeAuxiliaryLsp()).toBe(false);
+			expect(shouldPreferPullOnlyDiagnostics()).toBe(false);
+		} finally {
+			_resetLspBudgetDecisionForTests();
+			if (previousRegistry === undefined) {
+				delete process.env.PI_LENS_INSTANCE_REGISTRY;
+			} else {
+				process.env.PI_LENS_INSTANCE_REGISTRY = previousRegistry;
+			}
+			if (previousBudget === undefined) {
+				delete process.env.PI_LENS_CROSS_PROCESS_BUDGET;
+			} else {
+				process.env.PI_LENS_CROSS_PROCESS_BUDGET = previousBudget;
+			}
+			_resetInstanceRegistryEnabledForTests();
+		}
 	});
 
 	it("caches pressure from a fabricated registry file at the boundary", async () => {

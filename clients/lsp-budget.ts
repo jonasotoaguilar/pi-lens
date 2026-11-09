@@ -1,41 +1,60 @@
 /**
- * Cross-process LSP budget (#449 slice 2 — PROTOTYPE).
+ * Cross-process LSP budget (#449 slice 2).
  *
- * Slice 1 (#472/#474/#475, `clients/instance-registry.ts` +
- * `clients/instance-reaper.ts`) made every concurrent pi-lens process visible
- * to every other one via `~/.pi-lens/instances.json`. This module is the
- * first thing that DOES something with that visibility: a machine-wide cap
- * on total live LSP server processes. When a NEW session starts and the
- * machine is already over budget, it degrades its OWN spawn plan — it never
- * touches another instance's already-running servers.
+ * Every concurrent pi-lens process is visible to every other one via
+ * `~/.pi-lens/instances.json` (`clients/instance-registry.ts`). This module
+ * reads that registry and decides, for THIS session only, whether to shed work:
+ * a process that finds itself under pressure degrades its OWN spawn plan and
+ * never touches another instance's already-running servers.
  *
  * Deliberately NOT a clearinghouse: no negotiation, no reservation, no
  * cross-process locking. Each session reads the registry once at
- * `session_start`, decides locally, and moves on — a "position limit," per
- * the issue's own framing, not shared ownership of anyone else's servers.
+ * `session_start`, decides locally, and moves on — a "position limit," per the
+ * issue's own framing, not shared ownership of anyone else's servers.
  *
- * Degrade mechanism chosen for this first slice: skip spawning AUXILIARY LSP
- * servers (role:"auxiliary" in clients/lsp/server.ts — opengrep, ast-grep,
- * zizmor, typos, marksman) for the remainder of THIS session, keeping only
- * the primary language server per file. Auxiliaries are cross-cutting
- * scanners layered on top of (not required for) core diagnostics, so this is
- * the cheapest, highest-signal thing to shed under machine-wide pressure.
- * The cached decision also shortens this session's idle reset and lets
+ * Accounting rule: PER ROOT, with a machine-wide stop. Counting every live LSP
+ * child on the machine against one number charged a fan-out for load it did not
+ * cause: eight Gentle Shell children in eight worktrees, three servers each,
+ * pushed the machine total past the old ceiling, and the child that started
+ * last shed its fleet while its own root ran three servers. Two numbers replace
+ * that one:
+ *
+ * - `rootCeiling` (`DEFAULT_LSP_BUDGET_ROOT_CEILING = 16`) — the budget for ONE
+ *   project root, the original RAM back-of-envelope: ~250MB average RSS per
+ *   live LSP child (typescript-language-server/pyright cold-index spikes
+ *   higher, short-lived auxiliaries like typos-lsp are much lighter, so this is
+ *   a rough blend) against a soft ~4GB target per working tree. A host's fleet
+ *   is charged to its primary root ({@link getInstanceRoots}'s index 0) because
+ *   `LspChildEntry` carries no root of its own; a session degrades when ITS OWN
+ *   root is at or over this number, whatever the rest of the machine runs.
+ * - `machineCeiling` (`DEFAULT_LSP_BUDGET_CEILING = rootCeiling × 4 = 64`) — the
+ *   machine-wide stop, kept as the backstop against a genuinely runaway fleet
+ *   (several roots at their full budget, or a leak). Headroom is deliberate: a
+ *   legitimate fan-out of small children can never trip it, and the designed
+ *   remedy for machine-wide pressure is the root that exceeds its share
+ *   shedding, not an innocent latecomer. `PI_LENS_LSP_BUDGET_CEILING` still
+ *   caps the machine, and `PI_LENS_LSP_BUDGET_ROOT_CEILING` the single root.
+ *
+ * Excluded defaults, both deliberate and both named here because the rule reads
+ * narrower than the machine it guards:
+ *
+ * - A session that cannot name its own root keeps the pre-split machine-wide
+ *   rule at the SMALLER of the two ceilings: it cannot prove it is under its
+ *   share, so it stays conservative. In production `clients/lsp-budget.ts`
+ *   always names one (this process's registry entry, else the same
+ *   `process.cwd()` fallback the host adapters register with).
+ * - RSS pressure stays machine-wide. It measures the machine's real memory, and
+ *   no per-root share can bound that; a root under its LSP count budget still
+ *   degrades when the aggregate is over the configured RSS ceiling.
+ *
+ * Degrade mechanism: skip spawning AUXILIARY LSP servers (role:"auxiliary" in
+ * clients/lsp/server.ts — opengrep, ast-grep, zizmor, typos, marksman) for the
+ * remainder of THIS session, keeping only the primary language server per file.
+ * Auxiliaries are cross-cutting scanners layered on top of (not required for)
+ * core diagnostics, so this is the cheapest, highest-signal thing to shed under
+ * pressure. The cached decision also shortens this session's idle reset and lets
  * pull-capable servers skip their push fallback. All three degrade mechanisms
  * read the same session-boundary snapshot; pressure never changes mid-touch.
- *
- * Ceiling default (`DEFAULT_LSP_BUDGET_CEILING = 16`): a rough RAM-budget
- * back-of-envelope, not a measured figure (#620's CPU/RSS sampling had not
- * landed as of this prototype) — assume ~250MB average RSS per live LSP
- * child process (typescript-language-server/pyright cold-index spikes
- * higher, short-lived auxiliaries like typos-lsp are much lighter, so this
- * is a rough blend) against a soft target of ~4GB machine-wide dedicated to
- * the LSP fleet: 4000MB / 250MB ≈ 16. Deliberately conservative-permissive
- * for a first cut — the goal is to catch the "25 concurrent node.exe, several
- * at 600MB-2GB RSS" pathological pile-up this was written in response to
- * (dogfooding note, 2026-07-12/13), not to micromanage the common 2-4-agent
- * case. `PI_LENS_LSP_BUDGET_CEILING` overrides it once real-world data (#620)
- * says otherwise.
  *
  * Kill switch: `PI_LENS_CROSS_PROCESS_BUDGET=0` disables this module
  * entirely (every session always spawns its full fleet, today's behavior) —
@@ -44,16 +63,28 @@
  */
 
 import {
+	getAuthoritativeInstanceRoots,
+	getInstanceRoots,
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
 	readInstanceRegistry,
 } from "./instance-registry.js";
 import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
-import { isInPidNamespace, ownPidNamespace } from "./process-snapshot.js";
+import { normalizeFilePath } from "./path-utils.js";
+import {
+	isInPidNamespace,
+	ownPidNamespace,
+	ownProcessStartIfKnown,
+} from "./process-snapshot.js";
 
-/** See the module docstring for the derivation. */
-export const DEFAULT_LSP_BUDGET_CEILING = 16;
+/** Budget for one project root. See the module docstring for the derivation. */
+export const DEFAULT_LSP_BUDGET_ROOT_CEILING = 16;
+/** How many full-budget roots the machine-wide stop is willing to carry. */
+export const DEFAULT_LSP_BUDGET_MACHINE_HEADROOM = 4;
+/** Machine-wide stop. See the module docstring for why it sits above one root. */
+export const DEFAULT_LSP_BUDGET_CEILING =
+	DEFAULT_LSP_BUDGET_ROOT_CEILING * DEFAULT_LSP_BUDGET_MACHINE_HEADROOM;
 export const DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS = 60_000;
 
 /** `PI_LENS_CROSS_PROCESS_BUDGET=0` disables the budget check entirely —
@@ -62,10 +93,20 @@ export function isCrossProcessBudgetEnabled(): boolean {
 	return process.env.PI_LENS_CROSS_PROCESS_BUDGET !== "0";
 }
 
-/** `PI_LENS_LSP_BUDGET_CEILING` overrides {@link DEFAULT_LSP_BUDGET_CEILING}.
- *  Non-finite/non-positive overrides are ignored (NaN-guard house style, see
- *  clients/runtime-config.ts) — falls back to the default rather than
- *  silently producing a ceiling of 0 (which would degrade every session). */
+/** `PI_LENS_LSP_BUDGET_ROOT_CEILING` overrides
+ *  {@link DEFAULT_LSP_BUDGET_ROOT_CEILING}. Non-finite/non-positive overrides
+ *  are ignored (NaN-guard house style, see clients/runtime-config.ts) — falls
+ *  back to the default rather than silently producing a ceiling of 0 (which
+ *  would degrade every session). */
+export function getLspBudgetRootCeiling(): number {
+	const raw = Number(process.env.PI_LENS_LSP_BUDGET_ROOT_CEILING);
+	return Number.isFinite(raw) && raw > 0
+		? raw
+		: DEFAULT_LSP_BUDGET_ROOT_CEILING;
+}
+
+/** `PI_LENS_LSP_BUDGET_CEILING` overrides {@link DEFAULT_LSP_BUDGET_CEILING},
+ *  the machine-wide stop. Same NaN guard as every ceiling reader here. */
 export function getLspBudgetCeiling(): number {
 	const raw = Number(process.env.PI_LENS_LSP_BUDGET_CEILING);
 	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_LSP_BUDGET_CEILING;
@@ -85,24 +126,64 @@ export function getLspBudgetIdleTimeoutMs(): number {
 }
 
 export interface LspBudgetDecision {
-	/** Sum of `lspChildren.length` across every registry entry whose owning
-	 *  pid is currently alive. Entries whose parent pid is dead are excluded —
+	/** Sum of `lspChildren.length` across every registry entry whose owning pid
+	 *  is currently alive. Entries whose parent pid is dead are excluded —
 	 *  their children are the orphan reaper's job (clients/instance-reaper.ts),
 	 *  not counted as "live" load here. */
 	totalLiveLspServers: number;
+	/** The machine-wide stop. */
 	ceiling: number;
+	/** The budget for one project root. */
+	rootCeiling: number;
+	/** The roots this session named as its own, when it named any. */
+	ownRoots?: string[];
+	/** Live LSP children charged to this session's own root — the largest of its
+	 *  roots when it serves several. Absent when the session named none. */
+	ownRootLoad?: number;
+	ownRootOverBudget: boolean;
+	machineOverBudget: boolean;
+	/** The count-based verdict this session applies: its own root against
+	 *  `rootCeiling` plus the machine stop, or — with no root named — the total
+	 *  against the smaller of the two ceilings. */
+	countOverBudget: boolean;
 	totalRssBytes?: number;
 	rssCeilingBytes?: number;
 	rssPressure: boolean;
 	overBudget: boolean;
-	/** The one degrade mechanism this prototype implements: skip auxiliary
+	/** The one degrade mechanism this module implements: skip auxiliary
 	 *  LSP servers for the current session. Equal to `overBudget` today —
 	 *  broken out as its own field so a future slice can add a second,
-	 *  independently-triggered mechanism (e.g. shorter idle-reaper timeout)
-	 *  without every caller needing to re-derive it from `overBudget`. */
+	 *  independently-triggered mechanism without every caller needing to
+	 *  re-derive it from `overBudget`. */
 	degradeAuxiliary: boolean;
 	shortenIdleTimeout: boolean;
 	preferPullOnly: boolean;
+}
+
+export interface LspBudgetOptions {
+	/** Machine-wide stop. Defaults to {@link DEFAULT_LSP_BUDGET_CEILING}. */
+	machineCeiling?: number;
+	/** One root's budget. Defaults to {@link DEFAULT_LSP_BUDGET_ROOT_CEILING}. */
+	rootCeiling?: number;
+	rssCeilingBytes?: number;
+	now?: number;
+	ownNamespace?: string;
+	/** The roots the deciding session serves. Omit when it cannot name one; the
+	 *  pre-split machine-wide rule then applies (see the module docstring). */
+	ownRoots?: readonly string[];
+}
+
+/** The root keys a session named, or `undefined` when it named none. */
+function ownRootKeys(
+	roots: readonly string[] | undefined,
+): string[] | undefined {
+	if (roots === undefined) return undefined;
+	const keys: string[] = [];
+	for (const root of roots) {
+		const key = normalizeFilePath(root);
+		if (key.length > 0) keys.push(key);
+	}
+	return keys.length > 0 ? keys : undefined;
 }
 
 /**
@@ -124,11 +205,13 @@ export interface LspBudgetDecision {
 export function decideLspBudget(
 	registry: readonly InstanceEntry[],
 	isPidAlive: (pid: number) => boolean,
-	ceiling: number,
-	rssCeilingBytes?: number,
-	now = Date.now(),
-	ownNamespace?: string,
+	options: LspBudgetOptions = {},
 ): LspBudgetDecision {
+	const machineCeiling = options.machineCeiling ?? DEFAULT_LSP_BUDGET_CEILING;
+	const rootCeiling = options.rootCeiling ?? DEFAULT_LSP_BUDGET_ROOT_CEILING;
+	const rssCeilingBytes = options.rssCeilingBytes;
+	const now = options.now ?? Date.now();
+	const ownNamespace = options.ownNamespace;
 	const hasFreshHeartbeat = (instance: InstanceEntry) => {
 		const heartbeatMs = Date.parse(instance.heartbeatAt);
 		return (
@@ -144,6 +227,32 @@ export function decideLspBudget(
 		(sum, instance) => sum + instance.lspChildren.length,
 		0,
 	);
+	// One root's load: every live entry that works in it, through the registry's
+	// own root reader. A multi-root host is charged to its primary root, the one
+	// the host's own fleet runs from (see the module docstring's excluded
+	// defaults).
+	const loadByRoot = new Map<string, number>();
+	for (const instance of liveInstances) {
+		const primaryRoot = getInstanceRoots(instance)[0];
+		if (primaryRoot === undefined) continue;
+		const key = normalizeFilePath(primaryRoot);
+		loadByRoot.set(
+			key,
+			(loadByRoot.get(key) ?? 0) + instance.lspChildren.length,
+		);
+	}
+	const ownRoots = ownRootKeys(options.ownRoots);
+	const ownRootLoad =
+		ownRoots === undefined
+			? undefined
+			: Math.max(...ownRoots.map((key) => loadByRoot.get(key) ?? 0));
+	const ownRootOverBudget =
+		ownRootLoad !== undefined && ownRootLoad >= rootCeiling;
+	const machineOverBudget = totalLiveLspServers >= machineCeiling;
+	const countOverBudget =
+		ownRootLoad === undefined
+			? totalLiveLspServers >= Math.min(rootCeiling, machineCeiling)
+			: ownRootOverBudget || machineOverBudget;
 	const hasCompleteFreshSamples =
 		rssCeilingBytes !== undefined &&
 		liveInstances.length > 0 &&
@@ -170,10 +279,16 @@ export function decideLspBudget(
 		totalRssBytes !== undefined &&
 		rssCeilingBytes !== undefined &&
 		totalRssBytes >= rssCeilingBytes;
-	const overBudget = totalLiveLspServers >= ceiling || rssPressure;
+	const overBudget = countOverBudget || rssPressure;
 	return {
 		totalLiveLspServers,
-		ceiling,
+		ceiling: machineCeiling,
+		rootCeiling,
+		ownRoots,
+		ownRootLoad,
+		ownRootOverBudget,
+		machineOverBudget,
+		countOverBudget,
 		totalRssBytes,
 		rssCeilingBytes,
 		rssPressure,
@@ -195,8 +310,9 @@ export function decideLspBudget(
 
 let cachedDecision: LspBudgetDecision | undefined;
 
-/** True once the budget check has run this process and found the machine
- *  over the configured ceiling. Read by
+/** True once the budget check has run this process and found this session over
+ *  budget — its own root at the root budget, the machine-wide stop, or RSS
+ *  pressure. Read by
  *  `clients/dispatch/auxiliary-lsp.ts#enabledAuxiliaryLspServerIds`. Never
  *  throws; absent-decision (not yet checked, or disabled) reads as `false`. */
 export function shouldDegradeAuxiliaryLsp(): boolean {
@@ -216,33 +332,70 @@ export function _resetLspBudgetDecisionForTests(): void {
 	cachedDecision = undefined;
 }
 
+/** Caller overrides for {@link checkCrossProcessLspBudget}: a pre-read
+ *  registry and liveness predicate for tests, and the deciding session's own
+ *  roots when a caller already knows them. */
+export interface CrossProcessBudgetOverrides {
+	registry?: readonly InstanceEntry[];
+	isPidAlive?: (pid: number) => boolean;
+	/** The deciding session's own roots. Omitted => resolved from the registry
+	 *  (see {@link resolveOwnRoots}). */
+	ownRoots?: readonly string[];
+}
+
+/**
+ * The roots the deciding session serves, for per-root accounting: this
+ * process's registry entry when it has one, else the `process.cwd()` fallback
+ * the host adapters register with (`ctx.cwd ?? process.cwd()` in index.ts).
+ *
+ * The entry is matched the way `clients/instance-registry.ts` matches its own
+ * (`isOwnEntry`): the pid AND the recorded start, so a dead predecessor's entry
+ * on a recycled pid is never read as this session's. Roots go through
+ * {@link getAuthoritativeInstanceRoots}, so a `rootSource: "lsp-fallback"`
+ * entry's guessed index-0 root does not become an answer.
+ */
+function resolveOwnRoots(
+	registry: readonly InstanceEntry[],
+): readonly string[] | undefined {
+	const selfStart = ownProcessStartIfKnown();
+	const own = registry.find(
+		(entry) =>
+			entry.pid === process.pid &&
+			(entry.processStart === undefined || entry.processStart === selfStart),
+	);
+	const registered =
+		own === undefined ? [] : getAuthoritativeInstanceRoots(own);
+	if (registered.length > 0) return registered;
+	return [process.cwd()];
+}
+
 /**
  * Fire-and-forget budget check for `session_start`. Reads the instance
  * registry, decides via {@link decideLspBudget}, and caches the result for
- * `shouldDegradeAuxiliaryLsp` to read on subsequent dispatch calls. Never
- * throws — a failed check just leaves the cache at its "don't degrade"
- * default, matching every other best-effort registry consumer in this
- * codebase (registerInstance/sweepOrphans).
- *
+ * `shouldDegradeAuxiliaryLsp` to read on subsequent dispatch calls. Every call
+ * replaces the cache, so a session start always re-decides from the registry as
+ * it stands then. Never throws — a failed check just leaves the cache at its
+ * "don't degrade" default, matching every other best-effort registry consumer
+ * in this codebase (registerInstance/sweepOrphans).
  */
 export async function checkCrossProcessLspBudget(
-	testOverrides: {
-		registry?: readonly InstanceEntry[];
-		isPidAlive?: (pid: number) => boolean;
-	} = {},
+	testOverrides: CrossProcessBudgetOverrides = {},
 ): Promise<void> {
 	if (!isCrossProcessBudgetEnabled() || !isInstanceRegistryEnabled()) return;
 	try {
 		const registry = testOverrides.registry ?? (await readInstanceRegistry());
 		if (registry.length === 0) return; // nothing to be over budget against
-		const ceiling = getLspBudgetCeiling();
 		const decision = decideLspBudget(
 			registry,
 			testOverrides.isPidAlive ?? realIsPidAlive,
-			ceiling,
-			getLspBudgetRssCeilingBytes(),
-			Date.now(),
-			ownPidNamespace(),
+			{
+				machineCeiling: getLspBudgetCeiling(),
+				rootCeiling: getLspBudgetRootCeiling(),
+				rssCeilingBytes: getLspBudgetRssCeilingBytes(),
+				now: Date.now(),
+				ownNamespace: ownPidNamespace(),
+				ownRoots: testOverrides.ownRoots ?? resolveOwnRoots(registry),
+			},
 		);
 		cachedDecision = decision;
 		if (decision.overBudget) {
@@ -254,6 +407,11 @@ export async function checkCrossProcessLspBudget(
 				metadata: {
 					totalLiveLspServers: decision.totalLiveLspServers,
 					ceiling: decision.ceiling,
+					rootCeiling: decision.rootCeiling,
+					ownRoots: decision.ownRoots,
+					ownRootLoad: decision.ownRootLoad,
+					ownRootOverBudget: decision.ownRootOverBudget,
+					machineOverBudget: decision.machineOverBudget,
 					totalRssBytes: decision.totalRssBytes,
 					rssCeilingBytes: decision.rssCeilingBytes,
 					rssPressure: decision.rssPressure,

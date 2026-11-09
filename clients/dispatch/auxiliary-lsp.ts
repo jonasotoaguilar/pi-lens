@@ -553,13 +553,15 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
  *  to `touchFile` since it — not the LSP service — owns flag access).
  *
  * #449 slice 2 (prototype): when this process decided at `session_start` that
- * the machine-wide LSP budget is exceeded (`clients/lsp-budget.ts`), auxiliary
- * servers are skipped entirely for the rest of the session — the primary
+ * the LSP budget is exceeded (`clients/lsp-budget.ts`: a session degrades when
+ * its own project root is over its share or the machine-wide stop trips),
+ * auxiliary servers are skipped entirely for the rest of the session — the primary
  * language server per file is unaffected. This is a per-SESSION degrade, not
  * per-file: once over budget, this session never spawns its auxiliary fleet,
  * rather than flip-flopping file to file. */
 export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
-	// #449 slice 2 (budget): skip auxiliaries when machine-wide LSP budget is
+	// #449 slice 2 (budget): skip auxiliaries when this session's own root is
+	// over its LSP share, or the machine-wide stop trips.
 	// exceeded. #713 (subagent light mode): reuse the same seam, but only while
 	// BOTH premises hold — a live peer on this session's own root and an
 	// attachment to its fleet (`refreshSubagentAuxiliaryPeerCoverage` publishes

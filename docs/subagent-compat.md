@@ -78,6 +78,14 @@ the marker only feeds `isSubagentSession()`:
   base one (#713). Both derivations floor at the full-scan wall-clock ceiling,
   so they coincide under default constants; raising
   `PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS` above that floor is what separates them.
+- The LSP budget is charged per project root, with a machine-wide stop above
+  it (`clients/lsp-budget.ts`). A session degrades its auxiliary fleet, its idle
+  reset and its pull policy when its **own root** reaches its share
+  (`PI_LENS_LSP_BUDGET_ROOT_CEILING`, default 16) or when the **machine total**
+  reaches the stop (`PI_LENS_LSP_BUDGET_CEILING`, default 64), so a fan-out of
+  children across several roots no longer degrades a peer whose own root is
+  under its share. Memory pressure stays machine-wide, because it measures the
+  machine and no per-root share can bound it.
 - The instance-registry row this process writes is tagged with its best-effort
   subagent identity (`marker`, `agentType`, `parentPid`, `runId` —
   `registerInstanceNow()`, `clients/instance-registry.ts`), and carries no

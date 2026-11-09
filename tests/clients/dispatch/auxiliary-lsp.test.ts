@@ -18,6 +18,10 @@ import { resolvePiLensFlag } from "../../../clients/lens-config.js";
 import { getLensFlagSpec } from "../../../clients/lens-flag-registry.js";
 import { removeTempDirSync } from "../test-utils.js";
 import { _resetSubagentModeForTests } from "../../../clients/subagent-mode.js";
+import {
+	checkCrossProcessLspBudget,
+	_resetLspBudgetDecisionForTests,
+} from "../../../clients/lsp-budget.js";
 
 const diag = (over: Partial<LSPDiagnostic>): LSPDiagnostic =>
 	({
@@ -115,6 +119,67 @@ describe("auxiliary LSP enablement", () => {
 			delete process.env.PI_LENS_SUBAGENT_FULL;
 			_resetSubagentModeForTests();
 		}
+	});
+
+	// The cross-process budget is charged per project root, so a Gentle Shell
+	// fan-out no longer strips the fleet from a peer whose own root runs three
+	// servers. Every case here runs as a primary session: this is the fleet gate
+	// every session reads, not a subagent-only path.
+	describe("cross-process budget", () => {
+		const OWN_ROOT = "/worktrees/gentle-a";
+		const PEER_ROOT = "/worktrees/gentle-b";
+		const budgetChild = (pid: number) => ({
+			pid,
+			serverId: "typescript",
+			command: "typescript-language-server",
+			spawnedAt: new Date().toISOString(),
+		});
+		const budgetRoot = (pid: number, root: string, childCount: number) => ({
+			pid,
+			startedAt: new Date().toISOString(),
+			projectRoot: root,
+			projectRoots: [root],
+			lspChildren: Array.from({ length: childCount }, (_, i) =>
+				budgetChild(pid * 100 + i),
+			),
+			lspChildCount: childCount,
+			rssBytes: 0,
+			heartbeatAt: new Date().toISOString(),
+		});
+
+		beforeEach(() => {
+			_resetLspBudgetDecisionForTests();
+		});
+		afterEach(() => {
+			_resetLspBudgetDecisionForTests();
+		});
+
+		it("keeps the fleet for a peer whose own root is under its share in a fan-out", async () => {
+			await checkCrossProcessLspBudget({
+				registry: Array.from({ length: 8 }, (_, i) =>
+					budgetRoot(10 + i, `/worktrees/fan-${i}`, 3),
+				),
+				isPidAlive: () => true,
+				ownRoots: ["/worktrees/fan-3"],
+			});
+
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
+				"opengrep",
+				"ast-grep",
+				"zizmor",
+				"typos",
+			]);
+		});
+
+		it("skips the fleet for a session whose own root is at its budget", async () => {
+			await checkCrossProcessLspBudget({
+				registry: [budgetRoot(1, OWN_ROOT, 17), budgetRoot(2, PEER_ROOT, 2)],
+				isPidAlive: () => true,
+				ownRoots: [OWN_ROOT],
+			});
+
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
+		});
 	});
 
 	// Gentle Shell's vocabulary reaches the same #713 seam, so the existing gate
