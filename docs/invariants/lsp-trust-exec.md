@@ -29,6 +29,27 @@
   and a pinned site count. Extend the seam; never add a per-caller guard. A
   non-pi maintenance host that starts the checkout's own tools adopts trust at
   its entry, as the MCP entry points do.
+- A TypeScript launch decides its own server topology instead of inheriting the
+  classic wrapper's default. Only the `classic` variant's built-in
+  `initializationOptions.tsserver.useSyntaxServer` carries
+  `CLASSIC_TSSERVER_USE_SYNTAX_SERVER` (`clients/lsp/server.ts`); `native-ts7`
+  and `effect-tsgo` have no such option, keep their single-process launch shape,
+  and are never passed a flag they do not read. The classic key is a DEFAULT,
+  not a security key: a user `serverOverrides.typescript.initializationOptions`
+  value wins, because `mergeSpawnInitializationOptions`
+  (`clients/lsp/client-registry.ts`) takes the documented user-wins merge and
+  then re-pins ONLY the admitted `tsserver.path` (#4299), the key that decides
+  which compiler the wrapper forks. Dropping the classic wrapper's syntax server
+  removes no feature: that child is a latency split, and the semantic child
+  answers every feature. Each launch emits one `lsp_typescript_spawn_topology`
+  record naming `variant`, `topology` (`TypeScriptSpawnTopology`) and
+  `features: "all"`; the child census counts only the child pi-lens spawns,
+  never the wrapper's own forks.
+  `tests/clients/lsp/typescript-native-lsp.test.ts` pins the three variants,
+  `tests/clients/lsp/client-registry-direct.test.ts` pins the merge order and
+  the admitted-path re-pin, and
+  `tests/clients/lsp/typescript-tsserver-topology-census.test.ts` counts the
+  wrapper's children out of process.
 - Under pi, project trust is consumed through `isProjectTrusted`; pi-lens never
   registers the host's trust-answer handler. `compileLspRegistry` is the one admission
   seam for LSP executable fields: global config and built-ins remain allowed,

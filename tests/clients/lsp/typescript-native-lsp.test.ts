@@ -20,6 +20,10 @@ vi.mock("../../../clients/lsp/launch.js", () => ({
 	admitProjectSuppliedTsserver: (tsserverPath: string) => tsserverPath,
 }));
 
+import {
+	getRecentLoggedPhases,
+	_setRecentPhasesForTest,
+} from "../../../clients/latency-logger.js";
 import { TypeScriptServer } from "../../../clients/lsp/server.js";
 
 const dirs: string[] = [];
@@ -161,7 +165,7 @@ describe("TypeScript native LSP selection", () => {
 			},
 		});
 		expect(result?.initialization).toEqual({
-			tsserver: { path: tsserverPath },
+			tsserver: { path: tsserverPath, useSyntaxServer: "never" },
 		});
 		expect(result?.launchVariant).toBe("classic");
 	});
@@ -186,7 +190,7 @@ describe("TypeScript native LSP selection", () => {
 			},
 		});
 		expect(result?.initialization).toEqual({
-			tsserver: { path: tsserverPath },
+			tsserver: { path: tsserverPath, useSyntaxServer: "never" },
 		});
 	});
 
@@ -251,6 +255,131 @@ describe("TypeScript native LSP selection", () => {
 		// and the nearer install still shadows the ancestor native compiler.
 		expect(launchLSP).not.toHaveBeenCalled();
 		expect(result).toBeUndefined();
+	});
+});
+
+/**
+ * Fleet-memory T2 (spec S2-S3): pi-lens decides the tsserver process topology
+ * instead of inheriting the classic wrapper's default, and says so once per
+ * launch.
+ *
+ * Baseline E4b measured the inherited default on one TypeScript root: a
+ * `typescript-language-server` wrapper (73 MB) plus TWO `tsserver` children,
+ * `--serverMode partialSemantic` (156 MB) and the full semantic server
+ * (182 MB), which `instances.json`'s `lspChildCount` reports as ONE child
+ * because it counts the child pi-lens spawns and not the wrapper's own forks.
+ * The installed wrapper reads `initializationOptions.tsserver`
+ * (`useSyntaxServer: "never"` selects its single-server topology), so pi-lens
+ * asks for that and states the choice in one `lsp_typescript_spawn_topology`
+ * record. The typescript-go launches (`tsc --lsp`, `effect-tsgo`) have no such
+ * option: they keep their launch shape and emit the same record.
+ */
+describe("TypeScript tsserver process topology (fleet memory T2)", () => {
+	beforeEach(() => {
+		ensureTool.mockReset();
+		ensureTool.mockResolvedValue(undefined);
+		getToolEnvironment.mockClear();
+		launchLSP.mockReset();
+		launchLSP.mockResolvedValue(fakeProcess);
+		// The ring survives a case, so a row from an earlier launch would be
+		// counted as this launch's record.
+		_setRecentPhasesForTest([]);
+	});
+
+	afterEach(() => {
+		for (const dir of dirs.splice(0)) removeTempDirSync(dir);
+	});
+
+	/** The one record this launch emitted, keyed by its phase. */
+	function spawnTopologyRecords() {
+		return getRecentLoggedPhases().filter(
+			(row) => row.phase === "lsp_typescript_spawn_topology",
+		);
+	}
+
+	it("asks the classic wrapper for one full-semantic tsserver and records that topology", async () => {
+		const root = makeProject("6.0.3");
+		const { tsserverPath } = addClassicServer(root);
+
+		const result = await TypeScriptServer.spawn(root, { allowInstall: false });
+
+		expect(result?.initialization).toEqual({
+			tsserver: { path: tsserverPath, useSyntaxServer: "never" },
+		});
+		expect(spawnTopologyRecords().map((row) => row.metadata)).toEqual([
+			{
+				tool: "typescript",
+				variant: "classic",
+				topology: "semantic-only",
+				features: "all",
+			},
+		]);
+	});
+
+	it("records the single-process topology for the native TypeScript 7 launch, whose launch shape is unchanged", async () => {
+		const root = makeProject("7.0.2");
+		const command = addNativeTsc(root);
+
+		const result = await TypeScriptServer.spawn(root, { allowInstall: false });
+
+		expect(launchLSP).toHaveBeenCalledWith(command, ["--lsp", "--stdio"], {
+			cwd: root,
+			env: { PI_LENS_TEST_TOOLCHAIN: "1" },
+		});
+		expect(result).toEqual({
+			process: fakeProcess,
+			source: "direct",
+			launchVariant: "native-ts7",
+		});
+		expect(spawnTopologyRecords().map((row) => row.metadata)).toEqual([
+			{
+				tool: "typescript",
+				variant: "native-ts7",
+				topology: "single-process",
+				features: "all",
+			},
+		]);
+	});
+
+	it("records the single-process topology for the effect-tsgo launch, whose launch shape is unchanged", async () => {
+		const root = makeProject("7.0.2");
+		addNativeTsc(root);
+		const effectBin = path.join(
+			root,
+			"node_modules",
+			".bin",
+			process.platform === "win32" ? "effect-tsgo.cmd" : "effect-tsgo",
+		);
+		fs.mkdirSync(path.dirname(effectBin), { recursive: true });
+		fs.writeFileSync(effectBin, "");
+		fs.mkdirSync(path.join(root, "node_modules", "@effect", "tsgo"), {
+			recursive: true,
+		});
+		fs.writeFileSync(
+			path.join(root, "node_modules", "@effect", "tsgo", "package.json"),
+			JSON.stringify({ name: "@effect/tsgo", version: "0.62.0" }),
+		);
+
+		const result = await TypeScriptServer.spawn(root, { allowInstall: false });
+
+		expect(launchLSP).toHaveBeenCalledWith(
+			effectBin,
+			["tsc", "--lsp", "--stdio"],
+			{ cwd: root, env: { PI_LENS_TEST_TOOLCHAIN: "1" } },
+		);
+		expect(result).toEqual({
+			process: fakeProcess,
+			source: "direct",
+			launchVariant: "effect-tsgo",
+		});
+		expect(spawnTopologyRecords().map((row) => row.metadata)).toEqual([
+			{
+				tool: "typescript",
+				variant: "effect-tsgo",
+				topology: "single-process",
+				features: "all",
+			},
+		]);
 	});
 });
 
