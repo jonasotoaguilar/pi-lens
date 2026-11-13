@@ -39,12 +39,18 @@ import {
 	setupTestEnvironment,
 } from "./test-utils.js";
 
-function closeServer(server: net.Server | undefined): void {
+/**
+ * Close a test server and WAIT for the close to finish: `close()` reports its
+ * completion through a callback (or a promise in Node 20+), and the handle
+ * outlives the case when nothing awaits that. The only call site is the
+ * teardown hook below, which is async for this reason.
+ */
+async function closeServer(server: net.Server | undefined): Promise<void> {
 	if (!server) return;
 	(
 		server as net.Server & { closeAllConnections?: () => void }
 	).closeAllConnections?.();
-	server.close();
+	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 function entry(pid: number, root: string, heartbeatAt: string): InstanceEntry {
@@ -247,7 +253,9 @@ describe("warm-attach records a missing incumbent endpoint (#3255)", () => {
 //    session in one workspace bound the first session's name; once the unlink
 //    reached the bound file it silently replaced the live listener (F1);
 //  - the unlink could delete an unrelated regular file at the truncated name
-//    (F2).
+//    (F2);
+//  - Node refuses a path past `sun_path` with EINVAL rather than cutting it, so
+//    both this fixture and the listener must name the BOUND file (#4376 r2).
 // Session A is a stub listener on another pid's endpoint; session B is the real
 // `configureWarmAttach` of this process.
 describe.skipIf(process.platform === "win32")(
@@ -285,6 +293,17 @@ describe.skipIf(process.platform === "win32")(
 			).includes(`pi-lens-mcp-${process.pid}-`);
 		}
 
+		/**
+		 * The name `net` actually binds or dials: the `sun_path`-bounded one. Node
+		 * refuses a longer path with EINVAL rather than cutting it (#4376), so a
+		 * case that hands `net` the untruncated spelling is testing the runtime's
+		 * argument check, not this tree's name ownership. Every listener and every
+		 * probe below therefore names the file the OS accepts.
+		 */
+		function boundEndpoint(cwd: string, pid: number): string {
+			return boundUnixSocketPath(diagnosticsIpcPathForCwd(cwd, pid));
+		}
+
 		it("never replaces a live listener of another session in the workspace", async () => {
 			await withLongTmp(async ({ cwd }) => {
 				let reached = 0;
@@ -292,7 +311,10 @@ describe.skipIf(process.platform === "win32")(
 					reached += 1;
 					socket.end();
 				});
-				const endpointA = diagnosticsIpcPathForCwd(cwd, OTHER_PID);
+				const derivedA = diagnosticsIpcPathForCwd(cwd, OTHER_PID);
+				const endpointA = boundEndpoint(cwd, OTHER_PID);
+				expect(endpointA, "the long root cut A's name").not.toBe(derivedA);
+				expect(endpointA).toContain(`pi-lens-mcp-${OTHER_PID}-`);
 				await new Promise<void>((resolve) =>
 					sessionA.listen(endpointA, resolve),
 				);
@@ -300,6 +322,12 @@ describe.skipIf(process.platform === "win32")(
 					await configureWarmAttach(cwd);
 					expect(await connectOutcome(endpointA)).toBe("connected");
 					expect(reached, "session A still owns its endpoint").toBe(1);
+					// B runs its own fleet BESIDE A. Without this, a B that never
+					// bound anything would satisfy the assertions above for the
+					// wrong reason and the ownership rule would go unproven.
+					expect(await connectOutcome(boundEndpoint(cwd, process.pid))).toBe(
+						"connected",
+					);
 				} finally {
 					(
 						sessionA as net.Server & { closeAllConnections?: () => void }
@@ -321,7 +349,7 @@ describe.skipIf(process.platform === "win32")(
 				// A pid inside the bound name makes the name B's own, so B clears the
 				// stale socket and listens. Without it the name is shared, B cannot
 				// tell whose socket it is, and it stays refused (cold fallback).
-				expect(await connectOutcome(endpoint)).toBe(
+				expect(await connectOutcome(boundEndpoint(cwd, process.pid))).toBe(
 					ownNameSurvives(cwd) ? "connected" : "ECONNREFUSED",
 				);
 			});
@@ -334,7 +362,9 @@ describe.skipIf(process.platform === "win32")(
 				fs.writeFileSync(bound, "user data");
 				await configureWarmAttach(cwd);
 				expect(fs.readFileSync(bound, "utf8")).toBe("user data");
-				expect(await connectOutcome(endpoint)).not.toBe("connected");
+				expect(await connectOutcome(boundEndpoint(cwd, process.pid))).not.toBe(
+					"connected",
+				);
 			});
 		});
 	},
@@ -371,9 +401,9 @@ describe.skipIf(process.platform === "win32")(
 			resetDegradationLedger();
 		});
 
-		afterEach(() => {
+		afterEach(async () => {
 			_resetWarmAttachForTests();
-			closeServer(peer);
+			await closeServer(peer);
 			peer = undefined;
 			resetDegradationLedger();
 			vi.unstubAllEnvs();

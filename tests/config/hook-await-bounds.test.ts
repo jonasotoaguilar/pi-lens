@@ -2320,6 +2320,14 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// `bounded()` itself awaits the raced work; this is the shared primitive's
 	// implementation await, not an additional hook-path await at the caller.
 	"clients/deadline-utils.ts": 1,
+	// 0 -> 1 (D1): `refreshSubagentAuxiliaryPeerCoverage` awaits
+	// `readInstanceRegistry()` to answer whether a live same-root peer serves this
+	// session. The caller (`clients/runtime-session.ts`) fires it instead of
+	// awaiting it, because a registry read must not delay `session_start`, and a
+	// turn that beats it enables the auxiliary fleet (the safe direction). It is a
+	// local file read, the same shape as `clients/instance-registry.ts`'s pinned
+	// reads, and cannot take the hook's signal until #2523 AC4 threads it.
+	"clients/dispatch/auxiliary-lsp.ts": 1,
 	// #4485: 20 -> 21. The cascade's silent-push wait,
 	// `touchedClient.waitForDiagnostics(path, SILENT_PUSH_WAIT_MS, ...)`, which
 	// carries its own 1000 ms deadline as an argument (the client resolves it
@@ -2503,7 +2511,12 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// 221 → 222 (#4937 review F1): `settleProbeCacheForTests` awaits one
 	// `flushProbeCache` so the tier-2 teardown can reject on a flush that did not
 	// land. Only the test helper registry calls it; no hook handler reaches it.
-	"clients/installer/index.ts": 222,
+	// 222 → 223 (D5): the lock-lost branch of `ensureToolResolved` asks
+	// `getToolPath` once more after its bounded wait expires, so a peer's
+	// completed install is adopted instead of skipped for the session. The
+	// re-ask is the same discovery probe the lock waiter below already awaits,
+	// and it cannot take the hook's signal until #2523 AC4 threads it.
+	"clients/installer/index.ts": 223,
 	// 29 -> 56 (#4765): refreshOpengrepRulePack (the background registry-pack
 	// refresh) awaits the pack download, its temp-file write, the
 	// `opengrep --validate` spawn, a stat/read/rename of the cached file and a

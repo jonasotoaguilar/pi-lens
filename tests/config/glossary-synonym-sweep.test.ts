@@ -843,6 +843,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/session-repository.ts": 1,
 		"clients/session-state-store.ts": 1,
 		"clients/sgconfig.ts": 3,
+		// 0 -> 1 (D1): `selectBlockingPeers` keeps the registry peers that carry
+		// no `subagent` stamp, an `Array.prototype.filter` call over peer rows,
+		// not a delivery filter.
+		"clients/shared-checkout-guard.ts": 1,
 		"clients/situational-tool-telemetry.ts": 2,
 		"clients/test-runner-client.ts": 8,
 		"clients/tool-cwd.ts": 1,

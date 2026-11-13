@@ -49,9 +49,12 @@ interface AttachState {
 	 * The endpoint the incumbent PUBLISHED in its registry entry, if any. Read
 	 * from the same entry that supplies `incumbentPid`, so the two cannot
 	 * describe different registrations; `undefined` means the peer predates the
-	 * field and the derived name is used, exactly as before.
+	 * field and the derived name is used, exactly as before. It is also the
+	 * value every reset path WRITES back (a takeover, a re-configure, the test
+	 * seam), so the declaration admits an explicit `undefined` rather than
+	 * making those writes a type error under `exactOptionalPropertyTypes`.
 	 */
-	incumbentEndpoint?: string;
+	incumbentEndpoint?: string | undefined;
 	local: boolean;
 	server?: net.Server;
 	servedDiagnosticHashes: Map<string, string>;
@@ -282,6 +285,12 @@ async function serveRequest(
 function startServer(cwd: string): void {
 	state.server?.close();
 	const endpoint = diagnosticsIpcPathForCwd(cwd, process.pid);
+	// THE name this process binds, unlinked and published. Node refuses a
+	// `sun_path`-crossing path with EINVAL instead of cutting it (#4376), and the
+	// derived pid-scoped name crosses it as soon as `TMPDIR` is long: listening on
+	// the untruncated endpoint left the warm channel dead. The cut happens here,
+	// once, so the bind, the unlink, and the published name are one string.
+	const bound = boundUnixSocketPath(endpoint);
 	// Only a stale socket at a name that still carries OUR pid: a truncated
 	// shared name may be another live session's endpoint (#4376 review r1, F1).
 	unlinkStaleUnixSocket(endpoint, { ownerPid: process.pid });
@@ -352,13 +361,13 @@ function startServer(cwd: string): void {
 		// its own derivation rather than dial a name this process never bound.
 		publishDiagnosticsEndpoint(undefined);
 	});
-	server.listen(endpoint);
+	server.listen(bound);
 	server.unref();
 	state.server = server;
 	// The name the OS accepts for this listener, cut once here rather than
 	// recomputed by every reader (#4353). A peer whose `os.tmpdir()` differs —
 	// every Gentle Shell child — reads it from this process's registry entry.
-	publishDiagnosticsEndpoint(boundUnixSocketPath(endpoint));
+	publishDiagnosticsEndpoint(bound);
 }
 
 export async function configureWarmAttach(cwd: string): Promise<void> {

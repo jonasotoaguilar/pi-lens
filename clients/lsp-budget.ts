@@ -165,12 +165,19 @@ export interface LspBudgetOptions {
 	machineCeiling?: number;
 	/** One root's budget. Defaults to {@link DEFAULT_LSP_BUDGET_ROOT_CEILING}. */
 	rootCeiling?: number;
-	rssCeilingBytes?: number;
+	/**
+	 * Machine RSS stop. The caller supplies whatever the environment resolves
+	 * (an unset/undecidable ceiling is `undefined`), so the declaration admits
+	 * that answer rather than forcing the caller to drop the key.
+	 */
+	rssCeilingBytes?: number | undefined;
 	now?: number;
-	ownNamespace?: string;
-	/** The roots the deciding session serves. Omit when it cannot name one; the
-	 *  pre-split machine-wide rule then applies (see the module docstring). */
-	ownRoots?: readonly string[];
+	/** The deciding process's pid namespace, when the host can name one. */
+	ownNamespace?: string | undefined;
+	/** The roots the deciding session serves. Omit — or pass the `undefined` the
+	 *  resolver answers when it cannot name a namespace — when it cannot name one;
+	 *  the pre-split machine-wide rule then applies (see the module docstring). */
+	ownRoots?: readonly string[] | undefined;
 }
 
 /** The root keys a session named, or `undefined` when it named none. */

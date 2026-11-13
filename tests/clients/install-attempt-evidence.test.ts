@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { describeInstallAttempt } from "../../clients/dispatch/runners/utils/availability-policy.js";
 import { withEnv } from "../support/with-env.js";
+import { waitFor } from "./interleaving-kit.js";
 
 const { safeSpawnAsync, logLatencySpy } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(),
@@ -86,9 +87,19 @@ beforeEach(() => {
 	piLensHome = fs.mkdtempSync(
 		path.join(os.tmpdir(), "pi-lens-install-attempt-"),
 	);
+	// Every case here rests on the premise that none of these tools is installed:
+	// the discovery rung resolves nothing, so the install half actually runs and
+	// records. A host with `fish-lsp` (or any other managed tool) on PATH broke
+	// that premise — `getToolPath` answered from PATH, no install ran, and the
+	// attempt row these cases read was simply absent. Pin PATH to an empty
+	// directory inside the disposable home so only what a case plants is
+	// discoverable, on this host and on CI.
+	const emptyPathDir = path.join(piLensHome, "empty-path");
+	fs.mkdirSync(emptyPathDir, { recursive: true });
 	restoreEnv = withEnv({
 		PI_LENS_HOME: piLensHome,
 		PI_LENS_DISABLE_TOOL_INSTALL: undefined,
+		PATH: emptyPathDir,
 	});
 });
 
@@ -420,10 +431,32 @@ describe("the loser of the install-lock race (D5)", () => {
 		);
 		const { ensureTool, getInstallAttempt, getInstallFailureReason } =
 			await installer();
+		// The ledger the freshly imported installer writes to; importing it AFTER
+		// `installer()` is what makes it that instance and not a stale pre-reset one.
+		const { getDegradationSummary } =
+			await import("../../clients/degradation-ledger.js");
 
 		const pending = ensureTool("fish-lsp");
-		// The winner's install completes while this process is still waiting.
-		setTimeout(plantFishLspBinary, 50);
+		// The winner's install completes while this process waits for the lock, and
+		// the wait itself is the only event that can order the two: the lock
+		// contention record (`generation-lock-legacy-held`, written once by the
+		// first backing-off poll) proves the pre-lock resolution has finished, so
+		// planting there lands the binary between the two resolutions. Planting
+		// earlier would let the FIRST resolution find it and take the "already
+		// available" path, which never reaches the re-ask this case pins. A raw
+		// timer would make that ordering a wall-clock race instead of a premise.
+		await waitFor(
+			() =>
+				getDegradationSummary().some(
+					(group) => group.kind === "generation-lock-legacy-held",
+				),
+			(seen) => seen,
+			{
+				timeoutMs: 5_000,
+				yieldControl: () => new Promise((resolve) => setImmediate(resolve)),
+			},
+		);
+		plantFishLspBinary();
 		const resolved = await pending;
 
 		expect(getInstallAttempt("fish-lsp")).toMatchObject({

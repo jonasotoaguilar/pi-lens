@@ -29,13 +29,25 @@ const mocked = vi.hoisted(() => ({
 	attachedCodeActions: vi.fn(),
 }));
 
-vi.mock("../../../../clients/warm-attach.js", () => ({
-	isWarmAttached: () => true,
-	tryWarmAttachedDiagnostics: (...args: unknown[]) =>
-		mocked.attachedDiagnostics(...args),
-	tryWarmAttachedCodeActions: (...args: unknown[]) =>
-		mocked.attachedCodeActions(...args),
-}));
+vi.mock("../../../../clients/warm-attach.js", () => {
+	// In the real module `isWarmAttached()` IS this accessor's presence, so the
+	// double answers both from ONE attachment: a hard-coded `true` beside an
+	// absent accessor is a shape the producer never returns (defect shape 92),
+	// and omitting the accessor lets the reader this suite exercises reach
+	// `undefined` and throw instead of reading the seam.
+	const attachment = {
+		root: "/dev/null/warm-attach-root",
+		incumbentPid: 4242,
+	};
+	return {
+		warmAttachAttachment: () => attachment,
+		isWarmAttached: () => true,
+		tryWarmAttachedDiagnostics: (...args: unknown[]) =>
+			mocked.attachedDiagnostics(...args),
+		tryWarmAttachedCodeActions: (...args: unknown[]) =>
+			mocked.attachedCodeActions(...args),
+	};
+});
 
 import lspRunner from "../../../../clients/dispatch/runners/lsp.js";
 import { ENVIRONMENT_GAP_MARKER } from "../../../../clients/lsp/environment-gap.js";
