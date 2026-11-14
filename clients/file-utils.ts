@@ -83,7 +83,7 @@ import { machineStateDir } from "./probe-home-state.js";
  * inside user projects.
  */
 export function getProjectDataDir(cwd: string): string {
-	const legacyProjectDir = path.join(cwd, ".pi-lens");
+	const legacyProjectDir = legacyProjectDataDir(cwd);
 	const configuredBase = process.env.PILENS_DATA_DIR?.trim();
 	const resolvedBase = projectDataBase();
 	const memoKey = `${resolvedBase}\0${path.resolve(cwd)}`;
@@ -299,6 +299,81 @@ function copyIfMissing(
 function projectDataBase(): string {
 	const configuredBase = process.env.PILENS_DATA_DIR?.trim();
 	return configuredBase || path.join(getGlobalPiLensDir(), "projects");
+}
+
+/**
+ * The LEGACY per-project data directory, `<project>/.pi-lens`, which
+ * {@link getProjectDataDir} keeps using when no `PILENS_DATA_DIR` is set and
+ * the directory already exists. Exported because the containment question
+ * below has to cover it too, and one derivation is what keeps the two from
+ * drifting apart (#4689, defect shape 83).
+ */
+export function legacyProjectDataDir(cwd: string): string {
+	return path.join(cwd, ".pi-lens");
+}
+
+/**
+ * One directory pi-lens owns storage under, and the class a diagnostic record
+ * names it by.
+ */
+export interface PiLensDataRoot {
+	readonly label: "machine state dir" | "project data dir";
+	readonly dir: string;
+}
+
+/**
+ * Every directory pi-lens owns storage under for `projectRoot`, for a caller
+ * that must refuse to operate INSIDE one (an LSP root, #S4/T3):
+ *
+ * `machine state dir` — `getGlobalPiLensDir()`: `~/.pi-lens`, or the whole
+ * tree `PI_LENS_HOME` relocates it to (tools, the instance registry, the
+ * canonical config, server storage).
+ *
+ * `project data dir` — the base every per-project store sits below: `<machine
+ * state dir>/projects`, or `PILENS_DATA_DIR` when that override is set; plus
+ * the legacy `<project>/.pi-lens` arm of {@link getProjectDataDir}.
+ *
+ * Read per call, never captured at module load: every variable here is
+ * resolved by this module's own owner functions, so no caller spells a
+ * directory (#4689, defect shape 83). A path is asked about, never created.
+ */
+function piLensDataRoots(projectRoot: string): PiLensDataRoot[] {
+	return [
+		{ label: "machine state dir", dir: getGlobalPiLensDir() },
+		{ label: "project data dir", dir: projectDataBase() },
+		{
+			label: "project data dir",
+			dir: legacyProjectDataDir(projectRoot),
+		},
+	];
+}
+
+/**
+ * The pi-lens-owned directory CONTAINING `target`, or `undefined` when
+ * `target` is outside all of them. Containment is the shared `isUnderDir`
+ * (spelling and identity axes, platform path semantics), stated here once for
+ * every caller (defect shape 32).
+ *
+ * Two exclusions, both load-bearing:
+ *
+ *  - An ANCESTOR of a data root is outside: this never catches the session
+ *    root that holds one.
+ *  - A data root that CONTAINS (or is) the project root is not a boundary. The
+ *    owner's contract is one directory per project below the base
+ *    (`getProjectDataDir`: `<base>/<slug>`, or the legacy `<project>/.pi-lens`),
+ *    so a `PILENS_DATA_DIR` naming the project itself, an ancestor of it, or
+ *    `.` still stores under the project instead of owning it. Counting the base
+ *    itself would refuse every source root in the project, so this is excluded
+ *    by design: with such a base, the store's own slug directories lose the
+ *    refusal too (a named default, not a silent one).
+ */
+export function piLensDataRootContaining(
+	target: string,
+	projectRoot: string,
+): PiLensDataRoot | undefined {
+	return piLensDataRoots(projectRoot).find(
+		(row) => !isUnderDir(projectRoot, row.dir) && isUnderDir(target, row.dir),
+	);
 }
 
 const EPHEMERAL_DATA_DIR_NAME = ".ephemeral";

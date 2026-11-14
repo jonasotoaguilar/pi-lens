@@ -241,6 +241,39 @@
   dead pid, by the session-start sweep. A `pi-agent-*` path below the tmpdir
   that no checkout owns is declined at `resolveLspServerCwd` with one
   `lsp-root-declined` record per staging root per session.
+- No LSP root is inside pi-lens' own storage. `declinedRootReason`
+  (clients/lsp/client-registry.ts) is the one root-policy answer both the
+  acquisition path and the auxiliary coverage-gap ledger
+  (`skippedAuxiliaryServerIds`, clients/lsp/index.ts) ask: the root ceiling
+  (`declinesLooseFileRoot`, #4760) and the ownership rule
+  (`declinesPiLensDataRoot`, clients/lsp/server.ts). A root at or under the
+  machine state dir (`~/.pi-lens`, or what `PI_LENS_HOME` relocates it to), at
+  or under the project data store (`<machine state dir>/projects`, or
+  `PILENS_DATA_DIR`), or at or under the legacy `<project>/.pi-lens` is
+  refused. `clients/file-utils.ts` owns those directories
+  (`piLensDataRoots`) and the containment test is the shared `isUnderDir`, so
+  no caller re-spells a directory or a platform comparison. The refused file
+  gets no client at all: it is a policy decline, never a spawn at a
+  neighbouring directory, recorded once per (server, root) per session as
+  `lsp-root-declined` with the directory class and the root in its reason (the
+  home prefix folded on the path's IDENTITY, so a `$HOME` spelled through a
+  link prints `~`, while the subject keeps the existing `serverId:root`
+  identity policy), and the auxiliary lane counts it as a policy skip so the
+  touch reads partial rather than clean. An ancestor of a data root is outside,
+  so a session root that holds one still roots.
+- The data-root refusal is scoped to what a session SERVES. A file outside
+  every registered session root is declined earlier, by
+  `ClientRegistry.resolveServerRoot`'s session-root gate, with no
+  `lsp-root-declined` record: ordinary out-of-session data files stay quiet,
+  and only a store inside a served root reaches the policy.
+  `lsp-root-pi-lens-data-reachable.test.ts` measures both cells on the
+  initialized service. One default is excluded on purpose: a
+  `PILENS_DATA_DIR` that contains (or is) the project root is not a boundary,
+  because the owner stores one directory per project BELOW that base
+  (`getProjectDataDir`), so counting the base would refuse every source root in
+  the user's own project; under such a base the store's own slug directories
+  are not refused either. Generalization verdict: the machine state dir and the
+  legacy `<project>/.pi-lens` arm keep full coverage in every arm.
 - Per-path LSP notifications serialize read/build/send/record work. Pull
   cancellation blocks a same-path replacement until settlement. Waits are
   deadline- and abort-bounded, and silence is never clean.

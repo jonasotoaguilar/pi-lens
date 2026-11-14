@@ -165,7 +165,6 @@ import {
 } from "../reverse-deps.js";
 import type { LSPServerInfo } from "./server.js";
 import {
-	declinesLooseFileRoot,
 	getServerById,
 	resetClassicTsRepairGuard,
 	resetLspLaunchAvailabilityGeneration,
@@ -2810,9 +2809,10 @@ export class LSPService {
 	 * normal, expected answer.
 	 *
 	 * SCOPE, stated so the next reader does not assume the room is closed: this
-	 * covers the BREAKER doors only (cooldown + permanent), plus the #4760
-	 * root-policy decline, which is a PERMANENT policy answer (the resolved
-	 * root is at or above `$HOME`) and never retries in this session.
+	 * covers the BREAKER doors only (cooldown + permanent), plus the #4760 and
+	 * T3/S4 root-policy declines, which are PERMANENT policy answers (the
+	 * resolved root is at or above `$HOME`, or inside pi-lens' own data
+	 * directories) and never retry in this session.
 	 * `ensureClientForServer` also drops a scanner for a temporarily-unavailable
 	 * command (the #1496 latch), `optionalDisabled`, a spawn failure, or capacity
 	 * eviction. Those are the same defect class in the same lane, but they are
@@ -2858,7 +2858,11 @@ export class LSPService {
 				filePath,
 			);
 			if (!root) continue;
-			if (declinesLooseFileRoot(server, root)) {
+			// The registry owns the root policy (#4760 home ceiling, T3/S4 pi-lens
+			// data directories), so this coverage-gap ledger asks it rather than
+			// re-deriving either rule: a scanner declining for policy is a gap in
+			// THIS touch, never a clean scan.
+			if (this.clientRegistry.declinedRootReason(server, root)) {
 				policySkippedServerIds.push(server.id);
 				continue;
 			}

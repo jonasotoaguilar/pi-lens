@@ -57,6 +57,7 @@ import {
 } from "./launch.js";
 import {
 	declinesLooseFileRoot,
+	declinesPiLensDataRoot,
 	declinesProjectlessRoot,
 	enforceLspRootCeiling,
 	getServerById,
@@ -1119,6 +1120,25 @@ export class ClientRegistry {
 		return started;
 	}
 
+	/**
+	 * The ONE root-policy answer for a resolved root, before any process starts:
+	 * `undefined` when the root is eligible, otherwise the wording the bounded
+	 * `lsp-root-declined` record carries (#4760, T3/S4).
+	 *
+	 * Both rules live here so no caller re-derives either: the root ceiling
+	 * (`declinesLooseFileRoot`: at or above `$HOME` is too large to walk) and the
+	 * ownership rule (`declinesPiLensDataRoot`: pi-lens' own data directories,
+	 * whose spellings `clients/file-utils.ts` owns). The acquisition path below
+	 * refuses the spawn on this answer, and the coverage-gap path
+	 * (`LSPService.skippedAuxiliaryServerIds`) reports the same answer as a
+	 * policy skip, so a scanner declining for policy can never read as a clean
+	 * scan.
+	 */
+	declinedRootReason(server: LSPServerInfo, root: string): string | undefined {
+		if (declinesLooseFileRoot(server, root)) return "root at or above $HOME";
+		return declinesPiLensDataRoot(root, this.sessionCwd ?? process.cwd());
+	}
+
 	async ensureClientForServer(
 		filePath: string,
 		server: LSPServerInfo,
@@ -1145,14 +1165,19 @@ export class ClientRegistry {
 
 		const normalizedRoot = normalizeMapKey(root);
 		const key = `${server.id}:${normalizedRoot}`;
-		if (declinesLooseFileRoot(server, root)) {
-			// #4760: a root at or above `$HOME` is too large to walk. Decline BEFORE
-			// any process starts, on the policy path (no failure-ladder count, no
-			// breaker), with one bounded record per (server, root) per session.
+		const declinedRoot = this.declinedRootReason(server, root);
+		if (declinedRoot) {
+			// #4760: a root at or above `$HOME` is too large to walk; T3 (S4): a root
+			// inside pi-lens' own storage is the extension indexing itself. Decline
+			// BEFORE any process starts, on the policy path (no failure-ladder count,
+			// no breaker), with one bounded record per (server, root) per session.
+			// The file keeps no client at all: rooting it somewhere neighbouring
+			// would hand the fleet a tree nobody asked for, so the refusal IS the
+			// outcome and the record is where it lands.
 			recordDegradationOnce({
 				kind: "lsp-root-declined",
 				subject: key,
-				reason: `LSP root declined for ${server.id}: root at or above $HOME`,
+				reason: `LSP root declined for ${server.id}: ${declinedRoot}`,
 			});
 			this.noteSpawnVerdict(key, "declined");
 			return undefined;
