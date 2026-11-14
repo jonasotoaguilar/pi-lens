@@ -16,6 +16,7 @@ import {
 	getProjectIgnoreGlobs,
 	isExcludedDirName,
 	isPathIgnoredByProject,
+	piLensDataRootContaining,
 } from "../file-utils.js";
 import {
 	augmentPythonEnvironment,
@@ -46,6 +47,7 @@ import {
 	isUnderDir,
 	isWindowsPath,
 	isWithinForm,
+	homeRelativePath,
 	matchesWorkspaceMemberPattern,
 	normalizeEphemeralMapKey,
 	pathsEqual,
@@ -1869,6 +1871,71 @@ export function declinesLooseFileRoot(
 ): boolean {
 	if (server.looseFileRoot !== "decline") return false;
 	return isAtOrAboveHomeDir(
+		realpathOrResolve(root),
+		realpathOrResolve(os.homedir()),
+	);
+}
+
+/**
+ * T3 (S4): does the resolved `root` sit INSIDE pi-lens' own storage? It does
+ * for a root at or under the machine state dir (`getGlobalPiLensDir`: `~/.pi-lens`
+ * or what `PI_LENS_HOME` relocates it to), at or under the project data store
+ * (`<machine state dir>/projects`, or `PILENS_DATA_DIR`), and at or under the
+ * legacy `<project>/.pi-lens`.
+ *
+ * The hole this closes: {@link declinesLooseFileRoot} refuses only a root AT or
+ * ABOVE `$HOME`, so a dispatched file under `~/.pi-lens/projects/<slug>/cache`
+ * — where `RootWithFallback` lands it when no project marker exists above —
+ * rooted a language server inside the extension's own storage, and the fleet
+ * then indexed pi-lens' reports, indexes and snapshots for its whole warm
+ * lifetime. A `PI_LENS_HOME` or `PILENS_DATA_DIR` store outside `$HOME` had no
+ * gate at all.
+ *
+ * The directories are owned by `clients/file-utils.ts` (`piLensDataRoots`) and
+ * the containment test is the shared `isUnderDir`, so neither the spellings nor
+ * the platform semantics are re-derived here (defect shapes 32 and 83). The
+ * answer is a WORDING, not a boolean: the one bounded `lsp-root-declined`
+ * record names which class of directory refused the root, and `~` folding
+ * keeps the account name out of it. `undefined` means the root is outside every
+ * pi-lens-owned directory.
+ *
+ * This is a root-POLICY answer, so it holds for every server, not only the
+ * ones declaring `looseFileRoot: "decline"`, and it never catches an ancestor
+ * of a data root: a session root that happens to hold one still roots.
+ *
+ * SCOPE of the reachable defect: a file outside EVERY served session root is
+ * declined earlier (`ClientRegistry.resolveServerRoot`'s session-root gate),
+ * so this rule only decides files the session actually serves — measured, with
+ * the initialized service, by `lsp-root-pi-lens-data-reachable.test.ts`. The
+ * excluded default is a `PILENS_DATA_DIR` that contains (or is) the project
+ * root: that base is not a boundary, because the owner stores per project
+ * BELOW it, and counting it would refuse every source root in the project.
+ */
+export function declinesPiLensDataRoot(
+	root: string,
+	projectRoot: string,
+): string | undefined {
+	const owner = piLensDataRootContaining(root, projectRoot);
+	if (!owner) return undefined;
+	return `root inside pi-lens ${owner.label} (${foldHomePrefix(root)})`;
+}
+
+/**
+ * `root` with its home prefix folded to `~`, for a record that must not print
+ * the account name (#2440 F5).
+ *
+ * Two spells of the same home: `homeRelativePath` folds on the SPELLING, which
+ * is the common case (both sides come from the same environment). When `$HOME`
+ * is a symlink and the root is spelled with the real path, the spelling fold
+ * misses and would print the real home; the identity fold
+ * (`realpathOrResolve` on both sides, as `declinesLooseFileRoot` compares) then
+ * answers the same question. Only the reason uses this — the record's subject
+ * keeps the existing `serverId:root` identity policy.
+ */
+function foldHomePrefix(root: string): string {
+	const spelled = homeRelativePath(root);
+	if (spelled !== root) return spelled;
+	return homeRelativePath(
 		realpathOrResolve(root),
 		realpathOrResolve(os.homedir()),
 	);

@@ -653,6 +653,70 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 		}
 	});
 
+	// T3 (S4): the same door with the OWNERSHIP cause. A scanner whose resolved
+	// root sits inside pi-lens' own storage is declined by policy, so the touch
+	// that skipped it must read `"partial"` and name it: the extension indexing
+	// its own caches is a blackout, not a clean scan. The PRIMARY stays eligible,
+	// which is what makes this arm reachable — a declined primary leaves no touch
+	// to qualify. The store's spelling comes from its owner, never re-spelled.
+	it("a scanner declined for a pi-lens data root makes the touch partial, not confirmed", async () => {
+		const { home, restore } = pinFixtureHome("coverage-gap-data-root");
+		try {
+			// Imported here, not at the top: this file's hoisted `vi.mock` of the
+			// latency logger cannot be reached by `file-utils`' import graph before
+			// the factory initializes.
+			const { getGlobalPiLensDir } =
+				await import("../../../clients/file-utils.js");
+			const storeRoot = path.join(
+				getGlobalPiLensDir(),
+				"projects",
+				"demo",
+				"cache",
+			);
+			const file = path.join(storeRoot, "a.ts");
+			mkdirSync(storeRoot, { recursive: true });
+			writeFileSync(file, "content");
+			const project = path.join(home, "proj");
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const primary = makeClient("typescript", 0, [
+				makeDiagnostic("primary finding"),
+			]);
+			getServersForFileWithConfig.mockReturnValue([
+				makeServer("typescript", undefined, { root: async () => project }),
+				makeServer("opengrep", "auxiliary", {
+					looseFileRoot: "decline",
+					root: async () => storeRoot,
+				}),
+			]);
+			createLSPClient.mockResolvedValue(primary);
+
+			const pending = service.touchFile(file, "content", {
+				clientScope: "all",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				source: "cascade",
+			});
+			await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 20);
+			const result = (await pending) as
+				| { confirmation?: string; unconfirmedServerIds?: string[] }
+				| undefined;
+
+			// Only the primary spawned: the store root is declined before any process.
+			expect(createLSPClient).toHaveBeenCalledTimes(1);
+			expect(result?.confirmation).toBe("partial");
+			expect(result?.unconfirmedServerIds).toEqual(["opengrep"]);
+			const gapRows = rowsFor("lsp_scanner_coverage_gap");
+			expect(gapRows).toHaveLength(1);
+			expect(gapRows[0]?.metadata).toMatchObject({
+				policySkippedServerIds: ["opengrep"],
+			});
+		} finally {
+			restore();
+		}
+	});
+
 	// #1533 makes the "still confirmed" half load-bearing on this scope too: `"all"`
 	// now derives auxiliary coverage evidence from post-wait state, so a scanner that
 	// publishes for every file must keep every touch unqualified. This is the
