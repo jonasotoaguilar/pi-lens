@@ -381,6 +381,8 @@ const lspSpawnHeavyInclude = [
 	"tests/clients/lsp/touch-debounce-content-gate.test.ts",
 	// #4299: real wrapper compiler-resolution security witness.
 	"tests/clients/lsp/tsserver-project-trust-wire.test.ts",
+	// Fleet-memory T2: spawns through LSPService alone, so the lane's marker census cannot derive it; stated by hand.
+	"tests/clients/lsp/typescript-tsserver-topology-census.test.ts",
 	"tests/clients/lsp/workspace-diagnostics-language-neutral.test.ts",
 	// #4765: `OpengrepServer.spawn` cases launch a real PATH stub that only stays
 	// alive; no launchLSP/getServerById marker, so membership is by hand.
