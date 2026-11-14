@@ -40,6 +40,8 @@ import {
 	findAuxiliaryProfileForSource,
 	isOptInAuxiliaryServerId,
 	dropExcludedServers,
+	subagentFleetDeferredToPeer,
+	subagentPeerCoverageRoot,
 } from "../dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../file-role.js";
 import { emitBounded } from "../bounded-telemetry.js";
@@ -144,9 +146,12 @@ import {
 	type SpawnedServer,
 } from "./client-registry.js";
 export {
+	DEFAULT_ROOT_IDLE_EVICT_MS,
 	getLspClientCeiling,
 	getLspIdleEvictMs,
 	getLspIdleEvictMsForRoot,
+	getRootIdleEvictMs,
+	getRootIdleEvictMsForRoot,
 	mergeInitializationOptions,
 } from "./client-registry.js";
 export type {
@@ -797,6 +802,18 @@ export interface LSPTouchFileOptions {
 	 * their budgets.
 	 */
 	explicitQuery?: boolean;
+	/**
+	 * T1 of odd/tasks/lsp-fleet-memory: the caller already asked the warm
+	 * incumbent about THESE bytes and got no usable answer for them (a wedged
+	 * request, the request's own timeout, a schema refusal, an IPC error). Root
+	 * coverage is not byte coverage, so the primary-fleet deferral below never
+	 * applies to this touch: it is answered by a server here, or it is not
+	 * answered at all. Every fallback site that learns this from
+	 * `tryWarmAttachedDiagnostics` passes it
+	 * (`clients/dispatch/runners/lsp.ts`, `tools/lsp-diagnostics.ts`, and
+	 * `runWorkspaceDiagnostics`'s per-file loop in this file).
+	 */
+	peerAnswerUnavailable?: boolean;
 	/**
 	 * #799: which `warmupOverride` attempt this touch is (1 = the first
 	 * round trip against a cold server, 2 = `ensureWarmForSweep`'s single
@@ -4509,6 +4526,22 @@ export class LSPService {
 			this.recordOutsideRootDecline(filePath, outsideRoot, "touchFile");
 			return { diags: [], skipReason: "outside-project-root" };
 		}
+		// T1 of odd/tasks/lsp-fleet-memory: a subagent whose own exact root a live
+		// peer serves does not spawn a PRIMARY language server for a diagnostics
+		// touch of its own. The incumbent answers these bytes, and its fleet is the
+		// one the auxiliary gate already reuses (`subagentFleetDeferredToPeer`), so
+		// this door reads the same premise instead of inventing a second one:
+		// covered means covered by BOTH fleets, and any doubt (no attachment,
+		// another root, an unpublished endpoint, a peer that exited) has already
+		// re-armed the session toward running its own fleet by the time this reads
+		// it.
+		//
+		// Narrow on purpose. A `clientScope: "all"` aggregate sweep is an explicit
+		// all-server question whose ANSWER is the point, an `explicitQuery` is the
+		// single-file `lens_diagnostics` ask, and `peerAnswerUnavailable` says the
+		// caller already asked the peer about these bytes and got no answer. None
+		// may be answered by a fleet this process skipped; each runs its own
+		// servers instead.
 		// #1783: every path that asks a language server anything comes through
 		// here, so this is where the disk-drift backstop gets its heartbeat.
 		// Deliberately NOT awaited: the sweep is rate-limited to one pass per
@@ -4527,6 +4560,23 @@ export class LSPService {
 		const clientScope: LSPTouchClientScope =
 			options.clientScope ?? (diagnosticsMode === "full" ? "all" : "primary");
 		const useAllClients = clientScope === "all";
+		if (
+			clientScope !== "all" &&
+			options.explicitQuery !== true &&
+			options.peerAnswerUnavailable !== true &&
+			subagentFleetDeferredToPeer()
+		) {
+			const deferredRoot = subagentPeerCoverageRoot();
+			if (deferredRoot !== undefined) {
+				recordDegradationOnce({
+					kind: "lsp-primary-fleet-deferred-to-peer",
+					subject: normalizeMapKey(deferredRoot),
+					reason:
+						"a live peer on this exact root owns the primary language server, so this process starts none of its own for this touch",
+				});
+			}
+			return;
+		}
 		const resolvedPrimaryRoots = new Map<string, string>();
 		const attemptedAuxiliaryRoots = new Map<string, string>();
 		const waitSkipReasons = new Set<string>();
@@ -9667,6 +9717,13 @@ export class LSPService {
 								diagnostics: "document",
 								collectDiagnostics: true,
 								clientScope: "all",
+								// The incumbent did not answer these bytes. `clientScope:
+								// "all"` already exempts this touch from the primary-fleet
+								// deferral; naming the failed answer keeps that true if the
+								// scope ever narrows, and records why this sweep pays for a
+								// local server while attached.
+								peerAnswerUnavailable:
+									attached !== undefined && !attached.available,
 								source: "lens_diagnostics_full",
 								// #584: opengrep's findings for a full sweep come from the
 								// `opengrep-client.ts` CLI extractor (one project-wide scan,

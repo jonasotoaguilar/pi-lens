@@ -345,6 +345,38 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 		}
 	}
 
+	/** The file `touch` uses for `lang`, so a case that has to WARM the primary
+	 *  before applying pressure names the same path instead of restating it. */
+	function primaryFile(lang: Lang): string {
+		return path.join(tmp, `f${lang.ext}`);
+	}
+
+	/** Write the file `touch` will touch, and return its path. */
+	function writePrimaryFile(lang: Lang): string {
+		const file = primaryFile(lang);
+		fs.writeFileSync(file, "x\n");
+		return file;
+	}
+
+	/**
+	 * Obtain the PRIMARY client for `file` while this session is still inside
+	 * budget.
+	 *
+	 * T3 of odd/tasks/lsp-fleet-memory admits the primary language server to the
+	 * cross-process fleet budget, so a pressed session refuses to START a new
+	 * primary. The cases below are about what the client this session already OWNS
+	 * does with a pull-only wait, so they obtain it BEFORE `underPressure()`
+	 * applies the stop — which is also what a real session looks like when the
+	 * machine fills up after it started working. This is the production
+	 * acquisition path (`getClientForFile`); it opens no document and starts no
+	 * diagnostic wait, so each case's own `server.budgets` assertion still
+	 * measures only the call it names (asserted here rather than assumed).
+	 */
+	async function warmPrimary(file: string): Promise<void> {
+		expect(await service.getClientForFile(file)).toBeDefined();
+		expect(server.budgets).toEqual([]);
+	}
+
 	// The test budget sits above the driver's real deadline, so a stuck tool reds
 	// as the driver's named failure rather than as a bare vitest timeout.
 	beforeAll(() => {
@@ -543,10 +575,11 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 		// file for a check that never got an answer. PR #5318 review thread
 		// PRRT_kwDORt8rec60OLnk.
 		it("reads a pull that stopped at its own cap inside waitMs as timed out, never clean", async () => {
-			await underPressure();
 			useServer(Number.POSITIVE_INFINITY, RUST, PULL_CAP_MS);
 			const file = path.join(tmp, "lib.rs");
 			fs.writeFileSync(file, cppLines(50));
+			await warmPrimary(file);
+			await underPressure();
 
 			const result = await runTool({ path: file, waitMs: 30_000 }, tmp);
 
@@ -615,8 +648,7 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 			lang: Lang,
 			options: Record<string, unknown>,
 		): Promise<any> {
-			const file = path.join(tmp, `f${lang.ext}`);
-			fs.writeFileSync(file, "x\n");
+			const file = writePrimaryFile(lang);
 			return drive(service.touchFile(file, "x\n", options as any));
 		}
 
@@ -637,8 +669,9 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 		});
 
 		it("row 14: batch query, a failed rust-analyzer pull reads timed out", async () => {
-			await underPressure();
 			useServer(NEVER, RUST, FAILED_PULL_MS);
+			await warmPrimary(writePrimaryFile(RUST));
+			await underPressure();
 			const result = await touch(RUST, BATCH);
 			expect(server.budgets).toEqual([3000]);
 			expect(result.inconclusive).toBe(true);
@@ -675,12 +708,17 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 		);
 
 		it("row 18: dispatch runner, a failed rust-analyzer pull beside opengrep reads timed out", async () => {
+			const fakes = useServers(NEVER, RUST, [OPENGREP], FAILED_PULL_MS);
+			// Only the PRIMARY is warmed: opengrep is named explicitly by the
+			// dispatch caller's own `auxiliaryServerIds`, so it still starts under
+			// pressure and this row keeps proving the attribution beside it.
+			await warmPrimary(writePrimaryFile(RUST));
 			await underPressure();
-			useServers(NEVER, RUST, [OPENGREP], FAILED_PULL_MS);
 			const result = await touch(RUST, {
 				...DISPATCH,
 				auxiliaryServerIds: ["opengrep"],
 			});
+			expect(fakes.get("opengrep")?.budgets).toEqual([2500]);
 			expect(result.inconclusive).toBe(true);
 			expect(result.inconclusiveServerIds).toEqual(["rust-analyzer"]);
 		});
@@ -701,8 +739,9 @@ describe("#5306 explicit single-file lens_diagnostics query", () => {
 		});
 
 		it("row 21: cascade touch, a failed rust-analyzer pull reads timed out", async () => {
-			await underPressure();
 			useServer(NEVER, RUST, FAILED_PULL_MS);
+			await warmPrimary(writePrimaryFile(RUST));
+			await underPressure();
 			const result = await touch(RUST, CASCADE);
 			expect(server.budgets).toEqual([2000]);
 			expect(result.inconclusive).toBe(true);

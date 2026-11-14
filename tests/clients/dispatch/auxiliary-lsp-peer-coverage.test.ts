@@ -33,7 +33,7 @@ import {
 	_resetSubagentAuxiliaryPeerCoverageForTests,
 	enabledAuxiliaryLspServerIds,
 	refreshSubagentAuxiliaryPeerCoverage,
-	subagentAuxiliaryFleetDeferredToPeer,
+	subagentFleetDeferredToPeer,
 } from "../../../clients/dispatch/auxiliary-lsp.js";
 import {
 	type InstanceEntry,
@@ -64,6 +64,10 @@ const NOW = Date.now();
 
 const PEER_COVERAGE_PHASE = "subagent_auxiliary_peer_coverage";
 const REARM_PHASE = "subagent_auxiliary_peer_coverage_rearmed";
+/** The endpoint the peer PUBLISHED where it bound its listener. Coverage is a
+ *  borrowed attachment only when the incumbent proved it listens: T1 of
+ *  odd/tasks/lsp-fleet-memory reads `endpointPublished` as the third premise. */
+const PEER_ENDPOINT = path.join(os.tmpdir(), "pi-lens-peer-coverage-peer.sock");
 
 /** This process's parent: a real live pid that is never `process.pid` (the
  *  comparator excludes the caller's own entry by definition). */
@@ -75,12 +79,22 @@ function peerEntry(over: Partial<InstanceEntry> = {}): InstanceEntry {
 		startedAt: new Date(NOW - 60_000).toISOString(),
 		projectRoot: OWN_ROOT,
 		projectRoots: [OWN_ROOT],
+		diagnosticsEndpoint: PEER_ENDPOINT,
 		lspChildren: [],
 		lspChildCount: 0,
 		rssBytes: 0,
 		heartbeatAt: new Date(NOW).toISOString(),
 		...over,
 	};
+}
+
+/** Attach this session to the fabricated live peer the way production does: at
+ *  the endpoint the peer published for the root it bound. */
+function attachToPeer(
+	root: string = OWN_ROOT,
+	pid: number = LIVE_PEER_PID,
+): void {
+	_setWarmAttachForTests(root, pid, PEER_ENDPOINT);
 }
 
 function coverageRows() {
@@ -148,13 +162,13 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		_resetSubagentModeForTests();
 		try {
 			writeRegistry([peerEntry()]);
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			const deferred = await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 			});
 
 			expect(deferred).toBe(true);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(true);
+			expect(subagentFleetDeferredToPeer()).toBe(true);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
 			// A read that still holds its premises re-arms nothing.
 			expect(rearmRows()).toHaveLength(0);
@@ -174,7 +188,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			});
 
 			expect(deferred).toBe(false);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+			expect(subagentFleetDeferredToPeer()).toBe(false);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
 				"opengrep",
 				"ast-grep",
@@ -269,7 +283,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			// The registry's own read already degrades a torn file to "no known
 			// peer"; an unanswered coverage question must never read as covered.
 			expect(deferred).toBe(false);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+			expect(subagentFleetDeferredToPeer()).toBe(false);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 				"opengrep",
 			);
@@ -307,7 +321,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		const restore = withEnv({ PI_SUBAGENT_CHILD: "1" });
 		_resetSubagentModeForTests();
 		try {
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			const deferred = await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [
@@ -343,7 +357,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			});
 
 			expect(deferred).toBe(false);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+			expect(subagentFleetDeferredToPeer()).toBe(false);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 				"opengrep",
 			);
@@ -363,7 +377,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		try {
 			// This process reads another tree's fleet: the same-root peer exists on
 			// paper, and none of its answers reaches this root.
-			_setWarmAttachForTests(OTHER_ROOT, LIVE_PEER_PID);
+			attachToPeer(OTHER_ROOT);
 			const deferred = await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [peerEntry()],
@@ -391,7 +405,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			// Attached to a live incumbent for the right root, but that incumbent is
 			// not the instance registered as this root's peer: nothing proves the
 			// fleet answering this session scans this tree either.
-			_setWarmAttachForTests(OWN_ROOT, process.pid);
+			attachToPeer(OWN_ROOT, process.pid);
 			const deferred = await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [peerEntry()],
@@ -414,7 +428,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		_resetSubagentModeForTests();
 		try {
 			_resetWarmAttachForTests();
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [peerEntry()],
@@ -447,7 +461,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		_resetSubagentModeForTests();
 		try {
 			const deadPid = findDeadPid();
-			_setWarmAttachForTests(OWN_ROOT, deadPid);
+			attachToPeer(OWN_ROOT, deadPid);
 			// The decision-time liveness answer is injected ALIVE, which is what lets
 			// a covered decision exist at all; the read-time check is the
 			// production one, and it finds the incumbent gone.
@@ -473,7 +487,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		const restore = withEnv({ PI_SUBAGENT_CHILD: "1" });
 		_resetSubagentModeForTests();
 		try {
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [peerEntry()],
@@ -488,7 +502,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			// The attachment comes back, and the session still runs its own fleet:
 			// the transition is one-way, so the same session cannot flap back to a
 			// silent skip behind the premise that already failed once.
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 				"opengrep",
 			);
@@ -503,7 +517,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		const restore = withEnv({ PI_SUBAGENT_CHILD: "1" });
 		_resetSubagentModeForTests();
 		try {
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 				entries: [peerEntry()],
@@ -515,7 +529,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			// The process now holds a second root. Its answer is unknown, not the
 			// first root's answer: a cached decision keyed on nothing would have kept
 			// skipping the fleet on a tree no attached incumbent serves.
-			_setWarmAttachForTests(OTHER_ROOT, LIVE_PEER_PID);
+			attachToPeer(OTHER_ROOT);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 				"opengrep",
 			);
@@ -536,7 +550,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 		_resetSubagentModeForTests();
 		try {
 			writeRegistry([peerEntry()]);
-			_setWarmAttachForTests(OWN_ROOT, LIVE_PEER_PID);
+			attachToPeer();
 			const deferred = await refreshSubagentAuxiliaryPeerCoverage({
 				root: OWN_ROOT,
 			});
@@ -570,7 +584,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			});
 
 			expect(deferred).toBe(false);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+			expect(subagentFleetDeferredToPeer()).toBe(false);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
 				"opengrep",
 				"ast-grep",
@@ -599,7 +613,7 @@ describe("subagent auxiliary fleet is skipped only under real peer coverage", ()
 			// The answer arrived after its session was replaced: it must not decide
 			// the fleet of whichever session is current now (shape 22).
 			expect(deferred).toBe(false);
-			expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+			expect(subagentFleetDeferredToPeer()).toBe(false);
 			expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 				"opengrep",
 			);

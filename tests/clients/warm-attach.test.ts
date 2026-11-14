@@ -23,15 +23,18 @@ import {
 	configureWarmAttach,
 	selectWarmAttachIncumbent,
 } from "../../clients/warm-attach.js";
+import { getRecentLoggedPhases } from "../../clients/latency-logger.js";
 import {
 	_resetWarmAttachForTests,
 	_setWarmAttachForTests,
+	_setWarmAttachSocketModeForTests,
 	_warmAttachServerForTests,
 	isWarmAttached,
 	tryWarmAttachedCodeActions,
 	tryWarmAttachedDiagnostics,
 	warmAttachAttachment,
 } from "../../clients/warm-attach.js";
+import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
 import {
 	connectOutcome,
 	plantStaleUnixSocket,
@@ -86,8 +89,24 @@ describe("warmAttachAttachment", () => {
 
 	it("reports the root and the incumbent it reads from", () => {
 		_setWarmAttachForTests(cwd, 4_321);
-		expect(warmAttachAttachment()).toEqual({ root: cwd, incumbentPid: 4_321 });
+		expect(warmAttachAttachment()).toEqual({
+			root: cwd,
+			incumbentPid: 4_321,
+			endpointPublished: false,
+		});
 		expect(isWarmAttached()).toBe(true);
+	});
+
+	it("reports whether the incumbent published the endpoint it bound", () => {
+		// The fleet gates read this: an attachment that names a live pid but no
+		// bound endpoint is not a fleet anybody answers from (T1 of
+		// odd/tasks/lsp-fleet-memory).
+		_setWarmAttachForTests(cwd, 4_321, "/tmp/pi-lens-incumbent.sock");
+		expect(warmAttachAttachment()).toEqual({
+			root: cwd,
+			incumbentPid: 4_321,
+			endpointPublished: true,
+		});
 	});
 
 	it("drops the attachment when a dead incumbent promotes the session to local", async () => {
@@ -95,6 +114,183 @@ describe("warmAttachAttachment", () => {
 		await tryWarmAttachedDiagnostics("app.ts", "x", 10);
 		expect(warmAttachAttachment()).toBeUndefined();
 		expect(isWarmAttached()).toBe(false);
+	});
+});
+
+// S2 of odd/tasks/lsp-fleet-memory: warm attach is the PLUGIN's decision now.
+// Every session binds and publishes its own diagnostics endpoint, because a
+// child can only stop paying for a primary language server when something
+// answers for its root; a SUBAGENT attaches to a live same-root peer that
+// published where it listens. A primary session never attaches implicitly — it
+// owns its fleet — and `PI_LENS_WARM_ATTACH=0` opts back out.
+describe("configureWarmAttach decides participation without user configuration", () => {
+	/** This process's parent: a real live pid that is never `process.pid`. */
+	const PEER_PID = process.ppid;
+	const savedHome = process.env.PI_LENS_HOME;
+	const savedOptIn = process.env.PI_LENS_WARM_ATTACH;
+	const savedTmpDir = process.env.TMPDIR;
+	let tmpDir: string;
+	let home: string;
+	let root: string;
+
+	beforeEach(() => {
+		tmpDir = setupTestEnvironment("pi-lens-wa-default-").tmpDir;
+		home = path.join(tmpDir, "home");
+		root = path.join(tmpDir, "ws");
+		fs.mkdirSync(home, { recursive: true });
+		fs.mkdirSync(root, { recursive: true });
+		process.env.PI_LENS_HOME = home;
+		// The installed default: neither "1" nor "0".
+		delete process.env.PI_LENS_WARM_ATTACH;
+		// The bound endpoint lives under `os.tmpdir()`, so point it INSIDE the
+		// fixture: a case that binds and leaves would otherwise strand a socket
+		// file at the shared tmp root, which no sweep of this file can remove.
+		process.env.TMPDIR = tmpDir;
+		_resetWarmAttachForTests();
+		resetDegradationLedger();
+	});
+
+	afterEach(() => {
+		_resetWarmAttachForTests();
+		vi.unstubAllEnvs();
+		if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = savedHome;
+		if (savedOptIn === undefined) delete process.env.PI_LENS_WARM_ATTACH;
+		else process.env.PI_LENS_WARM_ATTACH = savedOptIn;
+		if (savedTmpDir === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = savedTmpDir;
+		_resetSubagentModeForTests();
+		resetDegradationLedger();
+	});
+
+	/** A live peer entry for `root`, publishing its endpoint only when given. */
+	function writePeer(diagnosticsEndpoint?: string): void {
+		fs.writeFileSync(
+			path.join(home, "instances.json"),
+			JSON.stringify({
+				instances: [
+					{
+						...entry(PEER_PID, root, new Date().toISOString()),
+						...(diagnosticsEndpoint === undefined
+							? {}
+							: { diagnosticsEndpoint }),
+					},
+				],
+			}),
+		);
+	}
+
+	function bindSubagent(): void {
+		vi.stubEnv("GENTLE_PI_AGENTS_CHILD", "1");
+		_resetSubagentModeForTests();
+	}
+
+	it("binds its own endpoint and stays local in a primary session", async () => {
+		writePeer(boundUnixSocketPath(diagnosticsIpcPathForCwd(root, PEER_PID)));
+
+		await configureWarmAttach(root);
+
+		// It bound: a subagent of this session has a real incumbent to borrow.
+		expect(_warmAttachServerForTests()).toBeDefined();
+		// It did not attach: a primary session owns its fleet.
+		expect(isWarmAttached()).toBe(false);
+		expect(warmAttachAttachment()).toBeUndefined();
+	});
+
+	it("attaches a subagent to a peer that published the endpoint it bound", async () => {
+		bindSubagent();
+		const published = boundUnixSocketPath(
+			diagnosticsIpcPathForCwd(root, PEER_PID),
+		);
+		writePeer(published);
+
+		await configureWarmAttach(root);
+
+		expect(warmAttachAttachment()).toEqual({
+			root,
+			incumbentPid: PEER_PID,
+			endpointPublished: true,
+		});
+	});
+
+	it("keeps a subagent local when the peer published no endpoint", async () => {
+		bindSubagent();
+		writePeer();
+
+		await configureWarmAttach(root);
+
+		// Nothing proves a listener exists there, so borrowing would obtain
+		// nothing: run our own fleet instead.
+		expect(isWarmAttached()).toBe(false);
+		expect(_warmAttachServerForTests()).toBeDefined();
+	});
+
+	// POSIX only: Windows binds a named pipe, which has no file mode to restrict.
+	// Lane: the Linux and macOS unit lanes; no win32 gate covers it.
+	it.skipIf(process.platform === "win32")(
+		"binds the diagnostics endpoint owner-only",
+		async () => {
+			await configureWarmAttach(root);
+
+			// The endpoint carries file BYTES to whoever may connect. Node creates the
+			// socket with `0777 & ~umask`, so a host with `umask 002` would expose it
+			// to every local user; the binder narrows it to the owner.
+			const bound = boundUnixSocketPath(
+				diagnosticsIpcPathForCwd(root, process.pid),
+			);
+			expect(fs.statSync(bound).mode & 0o777).toBe(0o600);
+			expect(_warmAttachServerForTests()).toBeDefined();
+		},
+	);
+
+	// POSIX only, same reason as above.
+	it.skipIf(process.platform === "win32")(
+		"publishes no listener it cannot restrict",
+		async () => {
+			// A host where the mode cannot be narrowed is a host where the endpoint
+			// would be readable by other local users. Fall back instead of exposing
+			// it: no listener, no published endpoint, and this session runs its own
+			// fleet (which is also what its children already do).
+			_setWarmAttachSocketModeForTests(() => {
+				throw Object.assign(new Error("EPERM: chmod not permitted"), {
+					code: "EPERM",
+				});
+			});
+
+			await configureWarmAttach(root);
+
+			expect(_warmAttachServerForTests()).toBeUndefined();
+			expect(isWarmAttached()).toBe(false);
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "warm-attach-socket-mode-unrestricted",
+				)?.count,
+			).toBe(1);
+			await registerInstance(root);
+			const own = (await readInstanceRegistry()).find(
+				(candidate) => candidate.pid === process.pid,
+			);
+			expect(own?.diagnosticsEndpoint).toBeUndefined();
+		},
+	);
+
+	it("binds nothing when the operator opts out", async () => {
+		vi.stubEnv("PI_LENS_WARM_ATTACH", "0");
+		bindSubagent();
+		writePeer(boundUnixSocketPath(diagnosticsIpcPathForCwd(root, PEER_PID)));
+
+		await configureWarmAttach(root);
+
+		expect(_warmAttachServerForTests()).toBeUndefined();
+		expect(isWarmAttached()).toBe(false);
+		// The opt-out is a decision, so it writes its own row under the phase a
+		// reader greps for, and the reason names this arm.
+		expect(
+			getRecentLoggedPhases().some(
+				(row) =>
+					row.phase === "lsp_warm_attach" && row.metadata?.reason === "opt-out",
+			),
+		).toBe(true);
 	});
 });
 
@@ -476,7 +672,11 @@ describe.skipIf(process.platform === "win32")(
 			writePeerEntry(published);
 
 			await configureWarmAttach(root);
-			expect(warmAttachAttachment()).toEqual({ root, incumbentPid: PEER_PID });
+			expect(warmAttachAttachment()).toEqual({
+				root,
+				incumbentPid: PEER_PID,
+				endpointPublished: true,
+			});
 			const result = await tryWarmAttachedDiagnostics("app.ts", "x", 1_000);
 			expect(result?.available, JSON.stringify(result)).toBe(true);
 			expect(isWarmAttached()).toBe(true);

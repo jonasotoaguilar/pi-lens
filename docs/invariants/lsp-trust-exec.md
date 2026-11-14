@@ -133,6 +133,33 @@
   to that adapter and are enforced by oxlint's `no-restricted-imports` in
   `.oxlintrc.json` (`npm run lint:js`, #2372/#277; it replaced the
   `lsp-capabilities-import-sweep` test in #4865).
+- Idle eviction is ONE decision with two layers, and the per-client layer owns
+  it. `ClientRegistry.scheduleIdleEviction` asks `idleEvictionPolicyFor` for the
+  bound and the record kind of one client: an adopted root keeps the adopted
+  window whatever its servers declare, a `transparent` server keeps the measured
+  window (an ephemeral root its own shorter one), an `unmeasured` server — the
+  registry default and every non-`transparent` built-in — carries the ROOT idle
+  bound, and a `resident` declaration arms nothing and stays on the fleet reset.
+  The root bound is `getRootIdleEvictMs()` in `clients/lsp/client-registry.ts`:
+  `max(DEFAULT_ROOT_IDLE_EVICT_MS = 240_000, getFullScanWallClockMs() +
+  SWEEP_IDLE_SAFETY_MARGIN_MS)`, the same derivation the fleet reset's base
+  delay reads, so no per-client bound can be armed shorter than a full workspace
+  sweep (#1618 acceptance criterion 6) and the two layers cannot drift.
+  `PI_LENS_LSP_ROOT_IDLE_EVICT_MS` is its probe/test spelling, like
+  `PI_LENS_LSP_IDLE_EVICT_MS` for the measured window. The process-wide reset
+  (`clients/runtime-turn.ts`) is the BACKSTOP, not the owner: the per-client
+  policy releases each client from its own last use, and the reset covers what a
+  per-client timer cannot — clients a quiet turn never touched, `resident`
+  declarations, and a session whose shorter subagent/budget reset lands first.
+  It clears every per-client timer as it retires the generation, so no client is
+  released twice. The two writers are discriminated by record kind, not prose:
+  a `transparent`/adopted/ephemeral release writes `lsp-idle-eviction` and a
+  root-bound release writes `lsp-root-idle-eviction` (subject `serverId:root`,
+  reason naming the root and the bound), while a `resident` declaration writes
+  `lsp-idle-eviction-declined` once per server per session. Both releases keep
+  the module's one shutdown reason, `idle_eviction`. The per-client policy needs
+  no session-ownership guard because it is armed by client USE, so a fleet in
+  use is never idle; the fleet reset keeps its `isPrimarySession` gate.
 - Idle-eviction policy is the registry's `idleEviction` field, declared per
   server. The nightly (`scripts/measure-lsp-idle-eviction.mjs`) measures every
   registry server's eviction cost and respawn safety into
@@ -155,7 +182,8 @@
   first (history: `HISTORY.md`, 2026-10-19).
   `tests/clients/lsp/lsp-registry-trust.test.ts` pins both directions;
   `scheduleIdleEviction` records `lsp-idle-eviction-declined` once per server
-  per session when it arms no timer.
+  per session when it arms no timer, which after T4 (#449) is a `resident`
+  declaration alone.
 - The server-role vocabulary and the declared trait table have one owner,
   `clients/lsp/server-traits.ts` (#1488, #1756 stage 1). Ask `isAuxiliary`,
   never a comparison against the role literal, and read `notifyInflightLimit`
@@ -322,6 +350,71 @@
   warm attachment or `touchFile`; an over-bound file returns a `too_large`
   result with its byte/line measurement and records
   `lsp-diagnostics-file-too-large` once per file per session.
+- A subagent whose own exact root a live peer serves runs no language server of
+  its own. The primary fleet and the auxiliary fleet read ONE coverage answer,
+  `subagentFleetDeferredToPeer` (`clients/dispatch/auxiliary-lsp.ts`), published
+  at `session_start` from the instance registry and re-validated on every read;
+  the primary gate sits on `touchFile` (`clients/lsp/index.ts`). Coverage needs a
+  peer registered on that EXACT root — a containing root is another tree — and
+  an attachment to it that published the endpoint it bound
+  (`WarmAttachAttachment.endpointPublished`), because a peer that never bound
+  cannot answer, and skipping a fleet for it loses the answers entirely. Any
+  doubt re-arms the session toward ENABLED, once, with one
+  `subagent_auxiliary_peer_coverage_rearmed` row: detached, another root, a
+  changed or exited incumbent, or an unreadable registry. The gate is narrow: an
+  explicit `clientScope: "all"` sweep and an `explicitQuery` still ask this
+  process's own servers, and an explicit LSP feature request (navigation,
+  rename) spawns through `getClientForFile` untouched. Warm attach is the
+  plugin's default (`configureWarmAttach`: every session binds and publishes,
+  only a SUBAGENT attaches, and `PI_LENS_WARM_ATTACH=0` opts out) exactly so a
+  borrowed attachment is real; a primary session never skips on a subagent's
+  claim. Proven by `tests/clients/lsp/primary-fleet-peer-deferral.test.ts`,
+  `tests/clients/dispatch/auxiliary-lsp-peer-coverage.test.ts` and
+  `tests/clients/warm-attach.test.ts`. Two limits complete the rule. Root
+  coverage is not byte coverage: the caller that already asked the peer about
+  these bytes and got no usable answer passes
+  `LSPTouchFileOptions.peerAnswerUnavailable` (the dispatch LSP runner, the
+  `lens_diagnostics` collection path and the workspace sweep in
+  `clients/lsp/index.ts`), and that touch always runs a server here — otherwise
+  the runner reports `skipped`/`unstarted` and the finding is lost. And the
+  endpoint every session now binds is owner-only: `startServer` narrows the
+  socket file to `0600` right after `listen` (Node creates it with
+  `0777 & ~umask`, and the channel carries file bytes), and a host where that
+  fails closes the listener, publishes nothing and records
+  `warm-attach-socket-mode-unrestricted`, so every session there runs its own
+  fleets.
+- The cross-process fleet budget (`clients/lsp-budget.ts`) admits the PRIMARY
+  language server as well as the auxiliaries. `cachedPrimarySpawnRefusal` is
+  read by `ClientRegistry.ensureClientForServer` on the ONE path that would
+  start a process: after the warm-reuse return, so a session keeps answering
+  from the servers it already owns, and after every cheap policy declination,
+  so a spawn those already refuse is never recorded as a budget refusal. It
+  sits BEFORE the spawn gate's capacity eviction, so a refused spawn never
+  costs another client its server. The refusal fires when the session's own
+  root is at its root ceiling, the machine is at its stop, or the RSS stop
+  tripped, and it degrades only: it closes, kills and steals nothing, and no
+  other instance's server is touched. One `lsp-primary-spawn-refused-by-budget`
+  row per refusing root (`recordDegradationOnce`, subject the charged root)
+  names the root and the ceiling. The mid-session re-check is
+  `primarySpawnBudgetRecheckDue`: no timer and no per-edit cost, because a
+  verdict older than `DEFAULT_LSP_BUDGET_RECHECK_MS` is re-read once on the next
+  cold spawn, and a process with no verdict is never gated on registry state it
+  never asked for. Joining a spawn already in flight starts no process and is
+  admitted; auxiliaries keep their own owner
+  (`enabledAuxiliaryLspServerIds`). One named excluded default: a root INSIDE
+  its own share still starts no new primary once the MACHINE is at its stop
+  (`DEFAULT_LSP_BUDGET_CEILING`, 64 at the defaults, against a root budget of
+  16). That is deliberate — a ceiling that may never evict another instance's
+  live server can only turn the newcomer away — and its population is every
+  primary the session has not started yet: one per untouched language, and the
+  whole primary fleet of a session that starts while the machine is already at
+  the stop. Servers the session already owns keep answering. The escapes are
+  `PI_LENS_LSP_BUDGET_CEILING`, `PI_LENS_LSP_BUDGET_ROOT_CEILING`,
+  `PI_LENS_LSP_BUDGET_RSS_MB` (off while unset), `PI_LENS_CROSS_PROCESS_BUDGET=0`
+  and `PI_LENS_INSTANCE_REGISTRY=0`;
+  `PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS` only shortens the idle reset. Proven by
+  `tests/clients/lsp/primary-spawn-budget-gate.test.ts` and
+  `tests/clients/lsp/client-registry-direct.test.ts`.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.

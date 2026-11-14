@@ -312,6 +312,13 @@ const lspRunner: RunnerDefinition = {
 						clientScope:
 							auxiliaryServerIds.length > 0 ? "with-auxiliary" : "primary",
 						auxiliaryServerIds,
+						// T1 of odd/tasks/lsp-fleet-memory: the warm attempt above asked the
+						// incumbent about THESE bytes and did not get them answered, so this
+						// touch may not be deferred to the fleet that owns the root — a
+						// skipped touch here answers nothing at all (`touched === undefined`
+						// reports `skipped`/`unstarted`, and the finding is lost).
+						peerAnswerUnavailable:
+							attached !== undefined && attached.available !== true,
 						maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
 						maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
 						source: "dispatch-lsp-runner",

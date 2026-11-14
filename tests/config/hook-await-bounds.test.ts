@@ -2558,9 +2558,25 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// wait its MCP caller already had; no hook awaits projectScan.
 	"clients/lens-engine.ts": 2,
 	"clients/lens-map.ts": 2,
-	"clients/lsp-budget.ts": 1,
+	// 1 -> 2 (T3 of odd/tasks/lsp-fleet-memory): the mid-session re-check awaits
+	// the shared single flight over `checkCrossProcessLspBudget` before answering
+	// a cold spawn, so one registry read serves every spawn inside the 30 s
+	// window. It sits on the spawn path, which no hook awaits (the spawn is
+	// reached from a tool result's dispatch), and the await cannot take the
+	// hook's signal until #2523 AC4 threads it; this records the measured count.
+	"clients/lsp-budget.ts": 2,
 	"clients/lsp-document-symbols.ts": 2,
 	"clients/lsp/cascade-tier.ts": 2,
+	// New to the one-hop set (T4 of odd/tasks/lsp-fleet-memory):
+	// `clients/runtime-turn.ts` now reads `getRootIdleEvictMs` from this module so
+	// the whole-fleet reset and the per-client root bound share one derivation
+	// instead of two that could drift. 21 of the 22 awaits pre-date the branch
+	// (server-root resolution, spawn, and shutdown/retire on the LSP client
+	// path); the one this branch adds is the cold spawn's `await
+	// recheckPrimarySpawnBudget()`. None can take a hook's signal until #2523 AC4
+	// threads it, and none runs inline in a hook: the reset reads a cached
+	// number and the spawn path is reached from dispatch.
+	"clients/lsp/client-registry.ts": 22,
 	"clients/lsp/config.ts": 4,
 	// #2817 round 2 F5: Git recovery now awaits the existing drift scheduler
 	// and its per-server root resolution. This remains an intentionally

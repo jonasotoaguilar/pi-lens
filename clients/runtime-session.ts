@@ -285,11 +285,13 @@ function notifyStartupWarmSkip(args: {
 
 /**
  * #713 corrected: decide, at the session boundary, whether this subagent's own
- * project root is already served by a live peer's auxiliary LSP fleet AND
- * whether this process reads that fleet's answers.
+ * project root is already served by a live peer's LSP fleet — auxiliaries AND
+ * the primary language server (T1 of odd/tasks/lsp-fleet-memory) — AND whether
+ * this process reads that fleet's answers.
  *
- * The auxiliary gate (`clients/dispatch/auxiliary-lsp.ts`) reads the answer
- * synchronously on every dispatch, so the registry read has to happen here —
+ * The fleet gates (`clients/dispatch/auxiliary-lsp.ts` and, for the primary,
+ * `clients/lsp/index.ts`'s `touchFile`) read the answer synchronously on every
+ * dispatch, so the registry read has to happen here —
  * the same split the machine-wide LSP budget degrade uses. Nothing is awaited:
  * a registry read must not delay `session_start`, and a dispatch that beats the
  * read enables the fleet, which is the safe direction. The module is imported
@@ -307,7 +309,7 @@ function notifyStartupWarmSkip(args: {
  * alternative and was rejected: it would give every short-lived child at least
  * one fleet spawn, which is the entire population this skip exists for.
  */
-function probeSubagentAuxiliaryPeerCoverage(args: {
+function probeSubagentPeerCoverage(args: {
 	root: string;
 	runtime: RuntimeCoordinator;
 	sessionGeneration: number;
@@ -324,8 +326,8 @@ function probeSubagentAuxiliaryPeerCoverage(args: {
 			if (!args.runtime.isCurrentSession(args.sessionGeneration)) return;
 			args.dbg(
 				covered
-					? `session_start subagent auxiliaries: deferred to a live peer on ${args.root}`
-					: `session_start subagent auxiliaries: enabled, no attached peer fleet covers ${args.root}`,
+					? `session_start subagent lsp: deferred to a live peer on ${args.root}`
+					: `session_start subagent lsp: enabled, no attached peer fleet covers ${args.root}`,
 			);
 		})
 		.catch(() => {
@@ -3092,7 +3094,7 @@ export async function handleSessionStart(
 	// probe that only ran on the full path would leave quick mode with no
 	// answer, which fails toward enabling the fleet in every covered child.
 	if (isSubagentSession()) {
-		probeSubagentAuxiliaryPeerCoverage({
+		probeSubagentPeerCoverage({
 			root: cwd,
 			runtime,
 			sessionGeneration: runtime.sessionGeneration,

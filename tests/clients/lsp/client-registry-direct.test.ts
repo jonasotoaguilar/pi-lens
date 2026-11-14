@@ -24,6 +24,11 @@ import {
 } from "../../../clients/degradation-ledger.js";
 import type { LSPClientInfo } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
+import {
+	_resetLspBudgetDecisionForTests,
+	checkCrossProcessLspBudget,
+} from "../../../clients/lsp-budget.js";
+import type { InstanceEntry } from "../../../clients/instance-registry.js";
 import { initLSPConfig } from "../../../clients/lsp/config.js";
 import {
 	ClientRegistry,
@@ -729,6 +734,80 @@ describe("ClientRegistry.admitAdoptedRoot (#4449)", () => {
 			),
 		).toBe(false);
 		expect(internals(f.registry).adoptedRootLastUsedAt.size).toBe(0);
+	});
+});
+
+describe("ClientRegistry.ensureClientForServer under the fleet budget (lsp-fleet-memory T3)", () => {
+	// The budget admits the PRIMARY server to the fleet ceiling, and it DEGRADES
+	// rather than evicts: the spawn it refuses must cost nobody else a server.
+	// That puts the gate after the warm-reuse return (an owned server keeps
+	// answering) and before the spawn gate's capacity eviction (a refused spawn
+	// must not free a slot by killing a live idle client).
+	async function primeOverBudget(root: string): Promise<void> {
+		const entry: InstanceEntry = {
+			pid: 4242,
+			startedAt: new Date(T0 - MIN).toISOString(),
+			projectRoot: root,
+			projectRoots: [root],
+			lspChildren: Array.from({ length: 16 }, (_, index) => ({
+				pid: 5000 + index,
+				serverId: "typescript",
+				command: "typescript-language-server",
+				spawnedAt: new Date(T0).toISOString(),
+			})),
+			lspChildCount: 16,
+			rssBytes: 0,
+			heartbeatAt: new Date(T0).toISOString(),
+		};
+		await checkCrossProcessLspBudget({
+			registry: [entry],
+			isPidAlive: () => true,
+			ownRoots: [root],
+		});
+	}
+
+	beforeEach(() => {
+		_resetLspBudgetDecisionForTests();
+	});
+
+	afterEach(() => {
+		_resetLspBudgetDecisionForTests();
+		delete process.env.PI_LENS_LSP_CLIENT_CEILING;
+	});
+
+	// Recurrence: the refusal could as easily sit inside the spawn gate, and then
+	// `makeCapacityForClient` would evict a live idle client to make a slot for a
+	// spawn the budget immediately refuses — a degrade mechanism that destroys
+	// another server to achieve nothing. Ceiling 1 makes that eviction the very
+	// next thing the registry would do.
+	it("refuses a new primary without evicting the server the session already owns", async () => {
+		process.env.PI_LENS_LSP_CLIENT_CEILING = "1";
+		const f = ensureFixture();
+		const first = await f.ensure();
+		expect(first?.client).toBe(f.spawned[0]);
+		expect(f.spawn).toHaveBeenCalledTimes(1);
+
+		await primeOverBudget(f.root);
+
+		// The owned server is still the answer for its own file: the refusal is
+		// about NEW spawns, so the warm-reuse path is reached and nothing closes.
+		const reused = await f.ensure();
+		expect(reused?.client).toBe(f.spawned[0]);
+
+		// A second primary server for the same session would need both a process
+		// and, at ceiling 1, a victim. It is refused on both counts.
+		const second = server("py", {
+			root: async () => f.root,
+			spawn: f.spawn,
+			idleEviction: "transparent",
+		});
+		await expect(
+			f.registry.ensureClientForServer(f.file, second),
+		).resolves.toBeUndefined();
+
+		expect(f.spawn).toHaveBeenCalledTimes(1);
+		expect(f.registry.clients.size).toBe(1);
+		expect(f.spawned[0].shutdown).not.toHaveBeenCalled();
 	});
 });
 

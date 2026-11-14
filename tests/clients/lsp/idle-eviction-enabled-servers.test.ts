@@ -271,7 +271,7 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		});
 	}
 
-	it("keeps an unmeasured registry server resident (policy-gate witness)", async () => {
+	it("keeps an unmeasured registry server off the transparent window (policy-gate witness)", async () => {
 		vi.useFakeTimers();
 		process.env.PI_LENS_LSP_IDLE_EVICT_MS = String(IDLE_WINDOW_MS);
 		doubleSpawnBoundary(RESIDENT_WITNESS_ID, () => nextPid);
