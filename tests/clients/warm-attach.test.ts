@@ -23,6 +23,7 @@ import {
 	configureWarmAttach,
 	selectWarmAttachIncumbent,
 } from "../../clients/warm-attach.js";
+import { getRecentLoggedPhases } from "../../clients/latency-logger.js";
 import {
 	_resetWarmAttachForTests,
 	_setWarmAttachForTests,
@@ -282,6 +283,14 @@ describe("configureWarmAttach decides participation without user configuration",
 
 		expect(_warmAttachServerForTests()).toBeUndefined();
 		expect(isWarmAttached()).toBe(false);
+		// The opt-out is a decision, so it writes its own row under the phase a
+		// reader greps for, and the reason names this arm.
+		expect(
+			getRecentLoggedPhases().some(
+				(row) =>
+					row.phase === "lsp_warm_attach" && row.metadata?.reason === "opt-out",
+			),
+		).toBe(true);
 	});
 });
 
