@@ -36,6 +36,7 @@ import {
 	_setWarmAttachForTests,
 } from "../../clients/warm-attach.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { waitFor } from "./interleaving-kit.js";
 
 const touchFileSpy = vi.hoisted(() => vi.fn());
 const logLatencySpy = vi.hoisted(() => vi.fn());
@@ -417,11 +418,14 @@ describe("quick-mode warmup LSP pre-warm (#947)", () => {
 				makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }),
 			);
 
-			await vi.waitFor(
-				() => {
-					expect(warmupPhaseLogged("warmup_total")).toBe(true);
-				},
-				{ timeout: 10_000 },
+			// The one-shot gate fires the warmup off an unref'd timer, so the phase
+			// arrives after `handleSessionStart` returns: a governed wait on the
+			// record, not a `vi.waitFor` real-clock poll (flake-shape
+			// `ungoverned-wait-for`, #1767).
+			await waitFor(
+				() => warmupPhaseLogged("warmup_total"),
+				(logged) => logged,
+				{ timeoutMs: 10_000 },
 			);
 			// The pass the one-shot print gate does NOT skip for this vocabulary:
 			// the scan-context verdict, the language-profile walk, and the index
@@ -462,11 +466,10 @@ describe("quick-mode warmup LSP pre-warm (#947)", () => {
 				makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }),
 			);
 
-			await vi.waitFor(
-				() => {
-					expect(warmupPhaseLogged("warmup_total")).toBe(true);
-				},
-				{ timeout: 10_000 },
+			await waitFor(
+				() => warmupPhaseLogged("warmup_total"),
+				(logged) => logged,
+				{ timeoutMs: 10_000 },
 			);
 			// `--mode rpc` alone changes nothing: the pre-warm spawns, which is
 			// exactly what a detected subagent child is spared.

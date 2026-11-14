@@ -1329,11 +1329,13 @@ describe(
 					);
 				});
 				try {
-					// The probe reads the registry asynchronously: poll for its published
-					// answer rather than asserting straight after session start.
-					await vi.waitFor(
-						() => expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(true),
-						{ timeout: HEAVY_IO_TIMEOUT_MS },
+					// The probe reads the registry asynchronously: wait on its published
+					// answer rather than asserting straight after session start. The
+					// governed helper, not `vi.waitFor`'s real-clock poll (#1767).
+					await waitForCondition(
+						() => subagentAuxiliaryFleetDeferredToPeer(),
+						(deferred) => deferred,
+						{ timeoutMs: HEAVY_IO_TIMEOUT_MS },
 					);
 					// End to end: the dispatch gate now skips the fleet.
 					expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
@@ -1398,14 +1400,13 @@ describe(
 					// Wait for the probe's own record before asserting: the registry read
 					// is asynchronous, so the absence of a decision proves nothing until
 					// the probe has published one.
-					await vi.waitFor(
+					await waitForCondition(
 						() =>
-							expect(
-								dbg.mock.calls.some(([msg]) =>
-									String(msg).includes("subagent auxiliaries: enabled"),
-								),
-							).toBe(true),
-						{ timeout: HEAVY_IO_TIMEOUT_MS },
+							dbg.mock.calls.some(([msg]) =>
+								String(msg).includes("subagent auxiliaries: enabled"),
+							),
+						(seen) => seen,
+						{ timeoutMs: HEAVY_IO_TIMEOUT_MS },
 					);
 					expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
 					expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(

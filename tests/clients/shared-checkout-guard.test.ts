@@ -808,30 +808,30 @@ describe("subagent siblings sharing one checkout (D1)", () => {
 	const SIBLING_PID = process.pid + 11;
 	const SECOND_SIBLING_PID = process.pid + 12;
 
-	let savedEnv: Record<string, string | undefined>;
-
 	beforeEach(() => {
-		savedEnv = {};
-		for (const key of SUBAGENT_VOCABULARY_KEYS) {
-			savedEnv[key] = process.env[key];
-			delete process.env[key];
-		}
+		// `vi.stubEnv` owns both halves of the save-and-restore this suite needs:
+		// the write records the value it replaced, and the covering
+		// `vi.unstubAllEnvs()` below puts back exactly what the worker had, so a
+		// run started inside a Gentle Shell child does not leak its own marker
+		// into the next case either. It is also the only spelling the restore
+		// sweep accepts for these writes (#4589): the key list is imported from
+		// `clients/subagent-mode.ts`, which the detector's structural key-list
+		// rule cannot read, while a stub write is answered by
+		// `vi.unstubAllEnvs()` without resolving a key at all.
+		for (const key of SUBAGENT_VOCABULARY_KEYS) vi.stubEnv(key, undefined);
 		_resetSubagentModeForTests();
 		latencyCalls.length = 0;
 		resetDegradationLedger();
 	});
 
 	afterEach(() => {
-		for (const key of SUBAGENT_VOCABULARY_KEYS) {
-			if (savedEnv[key] === undefined) delete process.env[key];
-			else process.env[key] = savedEnv[key];
-		}
+		vi.unstubAllEnvs();
 		_resetSubagentModeForTests();
 	});
 
 	/** This process as Gentle Shell launches it: the marker and nothing else. */
 	function asGentleShellChild(): void {
-		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		vi.stubEnv("GENTLE_PI_AGENTS_CHILD", "1");
 		_resetSubagentModeForTests();
 	}
 
@@ -941,7 +941,7 @@ describe("subagent siblings sharing one checkout (D1)", () => {
 		// The escape hatch means "behave like a full session", and the guard is
 		// part of full behavior: the same sibling set blocks it.
 		asGentleShellChild();
-		process.env.PI_LENS_SUBAGENT_FULL = "1";
+		vi.stubEnv("PI_LENS_SUBAGENT_FULL", "1");
 		_resetSubagentModeForTests();
 		const decision = await evaluateSharedCheckoutGuard(
 			"bash",
