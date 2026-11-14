@@ -301,12 +301,14 @@ export function isOptInAuxiliaryServerId(serverId: string): boolean {
 export type GetFlag = (flag: string) => boolean | string | undefined;
 
 /**
- * #713 corrected: whether a live peer instance ALREADY runs the auxiliary
- * fleet over this session's own project root AND this session reads its answers
- * from there. See {@link refreshSubagentAuxiliaryPeerCoverage} for the probe,
- * {@link subagentAuxiliaryFleetDeferredToPeer} for the premise re-check every
- * read performs, and {@link enabledAuxiliaryLspServerIds} for the gate that
- * reads this.
+ * #713, extended by T1 of odd/tasks/lsp-fleet-memory: whether a live peer
+ * instance ALREADY runs the LSP fleet (primary language server AND auxiliaries)
+ * over this session's own project root AND this session reads its answers from
+ * there. See {@link refreshSubagentAuxiliaryPeerCoverage} for the probe,
+ * {@link subagentFleetDeferredToPeer} for the premise re-check every read
+ * performs, {@link enabledAuxiliaryLspServerIds} for the auxiliary gate and
+ * `clients/lsp/index.ts`'s `touchFile` for the primary gate; both read the same
+ * decision rather than each deriving "is this root served elsewhere".
  */
 const PEER_COVERAGE_PHASE = "subagent_auxiliary_peer_coverage";
 const PEER_REARM_PHASE = "subagent_auxiliary_peer_coverage_rearmed";
@@ -340,7 +342,9 @@ let peerCoverage: AuxiliaryPeerCoverageDecision | undefined;
 
 /**
  * True only while a same-root live peer was confirmed for this session AND the
- * attachment that premise rests on still holds.
+ * attachment that premise rests on still holds — the one answer BOTH fleet
+ * gates read (auxiliaries in {@link enabledAuxiliaryLspServerIds}, the primary
+ * language server in `clients/lsp/index.ts`'s `touchFile`).
  *
  * The premise is re-checked HERE, on every read, rather than trusted from the
  * session boundary that measured it: warm attach is configured for one root and
@@ -354,7 +358,7 @@ let peerCoverage: AuxiliaryPeerCoverageDecision | undefined;
  * liveness probe (`process.kill(pid, 0)`, the shared pid check), and a session
  * that never skipped pays nothing here.
  */
-export function subagentAuxiliaryFleetDeferredToPeer(): boolean {
+export function subagentFleetDeferredToPeer(): boolean {
 	const decision = peerCoverage;
 	if (decision === undefined || !decision.covered) return false;
 	const broken = brokenPremise(decision);
@@ -364,7 +368,18 @@ export function subagentAuxiliaryFleetDeferredToPeer(): boolean {
 	return false;
 }
 
-/** Which premise stopped holding, or `undefined` while both still do. */
+/** The root the covered answer was measured for, or `undefined` while no live
+ *  attached peer covers this session. Read immediately after
+ *  {@link subagentFleetDeferredToPeer} answered `true` (no await between the two
+ *  reads), a caller that records the deferral names the root that owns the
+ *  servers instead of the file it happened to touch. */
+export function subagentPeerCoverageRoot(): string | undefined {
+	const decision = peerCoverage;
+	if (decision === undefined || !decision.covered) return undefined;
+	return decision.root;
+}
+
+/** Which premise stopped holding, or `undefined` while all of them still hold. */
 function brokenPremise(
 	decision: AuxiliaryPeerCoverageDecision,
 ): string | undefined {
@@ -508,7 +523,14 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
 			attached !== undefined && attachedRootMatches
 				? peers.find((peer) => peer.pid === attached.incumbentPid)
 				: undefined;
-		const covered = attachedPeer !== undefined;
+		// T1 of odd/tasks/lsp-fleet-memory: an attachment NAMES a peer, but only a
+		// peer that published the endpoint it bound can answer one. The derived-name
+		// fallback cannot tell a legacy peer that listens from a live session that
+		// never bound, and skipping a fleet for the second one loses the answers
+		// entirely — the trap that task names. So a dialable attachment is the third
+		// premise, checked here and not inferred from the pid.
+		const endpointPublished = attached?.endpointPublished === true;
+		const covered = attachedPeer !== undefined && endpointPublished;
 		peerCoverage = {
 			root: probe.root,
 			rootKey,
@@ -530,6 +552,7 @@ export async function refreshSubagentAuxiliaryPeerCoverage(
 					registryEntries: entries.length,
 					attached: attached !== undefined,
 					attachedRootMatches,
+					attachedEndpointPublished: endpointPublished,
 					attachedIncumbentPid: attached?.incumbentPid,
 				},
 			});
@@ -563,15 +586,17 @@ export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
 	// #449 slice 2 (budget): skip auxiliaries when this session's own root is
 	// over its LSP share, or the machine-wide stop trips.
 	// exceeded. #713 (subagent light mode): reuse the same seam, but only while
-	// BOTH premises hold — a live peer on this session's own root and an
-	// attachment to its fleet (`refreshSubagentAuxiliaryPeerCoverage` publishes
-	// the candidate, `subagentAuxiliaryFleetDeferredToPeer` re-validates it on
+	// the peer coverage premise holds — a live peer on this session's own root
+	// and an attachment to its fleet (`refreshSubagentAuxiliaryPeerCoverage`
+	// publishes the candidate, `subagentFleetDeferredToPeer` re-validates it on
 	// this read). A delegated child in another worktree or repository, or any
 	// child that is not warm-attached, has no fleet reading its tree, so it runs
 	// the fleet itself. PI_LENS_SUBAGENT_FULL=1 still restores full behavior via
-	// isSubagentSession() returning false.
+	// isSubagentSession() returning false. Since T1 of odd/tasks/lsp-fleet-memory
+	// the same answer gates the PRIMARY fleet (`clients/lsp/index.ts`
+	// `touchFile`), so a covered child pays for no language server at all.
 	if (shouldDegradeAuxiliaryLsp()) return [];
-	if (isSubagentSession() && subagentAuxiliaryFleetDeferredToPeer()) return [];
+	if (isSubagentSession() && subagentFleetDeferredToPeer()) return [];
 	return AUXILIARY_LSP_PROFILES.flatMap((p) =>
 		isEnabledByConfiguration(p, getFlag) ? [p.serverId] : [],
 	);

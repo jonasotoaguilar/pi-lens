@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import * as os from "node:os";
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,7 +34,7 @@ import {
 import {
 	_resetSubagentAuxiliaryPeerCoverageForTests,
 	enabledAuxiliaryLspServerIds,
-	subagentAuxiliaryFleetDeferredToPeer,
+	subagentFleetDeferredToPeer,
 } from "../../clients/dispatch/auxiliary-lsp.js";
 import { normalizeFilePath } from "../../clients/path-utils.js";
 import { _resetSlowFsForTests } from "../../clients/slow-fs.js";
@@ -54,6 +55,11 @@ import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 // `handleSessionStart` queues project-snapshot body writes that can recreate a
 // fixture root after its `env.cleanup()`; the drain lets them land first.
 useTrackedTempDirs("pi-lens-session-snapshot-");
+
+/** The endpoint a fabricated incumbent PUBLISHED where it bound its listener.
+ *  The fleet gates read it as `endpointPublished`: a peer that published
+ *  nothing proves no listener exists, so it covers nothing. */
+const PEER_ENDPOINT = path.join(os.tmpdir(), "pi-lens-session-start-peer.sock");
 
 /** A pid guaranteed dead on this machine, for orphan-staging-file tests
  *  (mirrors tests/clients/atomic-write-stage-gc.test.ts's helper). */
@@ -1307,7 +1313,10 @@ describe(
 				// short-lived agent the skip exists for.
 				const { env, dbg } = await runSessionStart("quick", (tmpDir) => {
 					const root = normalizeFilePath(tmpDir);
-					_setWarmAttachForTests(root, process.ppid);
+					// The attached peer must have PUBLISHED the endpoint it bound: a
+					// borrowed fleet nobody listens for is not coverage (T1 of
+					// odd/tasks/lsp-fleet-memory).
+					_setWarmAttachForTests(root, process.ppid, PEER_ENDPOINT);
 					fs.writeFileSync(
 						registryFile,
 						JSON.stringify({
@@ -1319,6 +1328,7 @@ describe(
 									startedAt: new Date(Date.now() - 60_000).toISOString(),
 									projectRoot: root,
 									projectRoots: [root],
+									diagnosticsEndpoint: PEER_ENDPOINT,
 									lspChildren: [],
 									lspChildCount: 0,
 									rssBytes: 0,
@@ -1333,7 +1343,7 @@ describe(
 					// answer rather than asserting straight after session start. The
 					// governed helper, not `vi.waitFor`'s real-clock poll (#1767).
 					await waitForCondition(
-						() => subagentAuxiliaryFleetDeferredToPeer(),
+						() => subagentFleetDeferredToPeer(),
 						(deferred) => deferred,
 						{ timeoutMs: HEAVY_IO_TIMEOUT_MS },
 					);
@@ -1342,9 +1352,7 @@ describe(
 					// The call site's own record, emitted only by its `.then`.
 					expect(
 						dbg.mock.calls.some(([msg]) =>
-							String(msg).includes(
-								"subagent auxiliaries: deferred to a live peer",
-							),
+							String(msg).includes("subagent lsp: deferred to a live peer"),
 						),
 					).toBe(true);
 				} finally {
@@ -1403,12 +1411,12 @@ describe(
 					await waitForCondition(
 						() =>
 							dbg.mock.calls.some(([msg]) =>
-								String(msg).includes("subagent auxiliaries: enabled"),
+								String(msg).includes("subagent lsp: enabled"),
 							),
 						(seen) => seen,
 						{ timeoutMs: HEAVY_IO_TIMEOUT_MS },
 					);
-					expect(subagentAuxiliaryFleetDeferredToPeer()).toBe(false);
+					expect(subagentFleetDeferredToPeer()).toBe(false);
 					expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain(
 						"opengrep",
 					);

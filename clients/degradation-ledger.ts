@@ -1207,6 +1207,22 @@ export type DegradationKind =
 	/** `lsp-notify-stall-cpu-busy`: A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "lsp-notify-stall-cpu-busy"
 	/**
+	 * `lsp-primary-fleet-deferred-to-peer`: T1 of odd/tasks/lsp-fleet-memory: a
+	 * SUBAGENT whose own exact project root a live peer serves, and whose warm
+	 * attach holds a real borrowed attachment to it, skipped its own PRIMARY
+	 * language server for a diagnostics touch. The incumbent answers those bytes,
+	 * so spawning a second fleet here is the duplication this gate exists to
+	 * stop. Subject is the covered root, recorded once per root per session: a
+	 * child that keeps working keeps one row, not one per touch.
+	 *
+	 * Only a COVERED session reaches this row. Every doubt — detachment, another
+	 * root, a changed or exited incumbent, a peer that published no endpoint,
+	 * an unreadable registry — re-arms the session toward running its own fleet
+	 * and lands on `subagent_auxiliary_peer_coverage_rearmed` instead, because a
+	 * child that skips its fleet without a usable attachment would get nothing.
+	 */
+	| "lsp-primary-fleet-deferred-to-peer"
+	/**
 	 * `lsp-probe-finding-policy`: #3071: `tools/lsp-diagnostics.ts`'s probe-disposition filter threw while
 	 * applying policy to a batch of findings; the batch is returned unfiltered
 	 * (nothing suppressed) rather than dropped. Subject is the cwd.

@@ -71,9 +71,11 @@ the marker only feeds `isSubagentSession()`:
 - `enabledAuxiliaryLspServerIds()` skips opengrep, ast-grep, zizmor and typos
   (`clients/dispatch/auxiliary-lsp.ts`) ONLY while a live peer instance is
   registered on the child's own project root AND this session is attached to a
-  fleet that can answer for it — see "Peer coverage" below. Warm attach is the
-  plugin's default now, so this skip is reachable on a default host, where it
-  used to need `PI_LENS_WARM_ATTACH=1`.
+  fleet that can answer for it — see "Peer coverage" below. `LSPService
+  .touchFile` skips the PRIMARY language server on the same premise
+  (`subagentFleetDeferredToPeer`), except for an explicit `clientScope: "all"`
+  sweep, an explicit single-file query, and a touch whose peer answer for those
+  bytes already failed. Without coverage the child runs its own fleets.
 - The turn-end LSP idle reset takes the shortened derivation
   (`getEffectiveLspIdleResetMs()`, `clients/runtime-turn.ts`) instead of the
   base one (#713). Both derivations floor at the full-scan wall-clock ceiling,
@@ -118,13 +120,27 @@ skip left such a child with no auxiliary coverage of a tree no other fleet
 serves.
 
 The skip is therefore conditioned on real peer coverage rather than on the
-marker alone, and it needs TWO premises — a registered fleet is not the same
+marker alone, and it needs THREE premises — a registered fleet is not the same
 fact as an obtainable one:
 
 1. a LIVE peer instance holds the child's own project root, exactly (a
-   containing root is another tree), and
-2. warm attach is attached to that peer for that same root, so the child
-   actually reads that fleet's answers.
+   containing root is another tree),
+2. warm attach is attached to that peer for that same root, and
+3. that attachment PUBLISHED the endpoint it bound
+   (`WarmAttachAttachment.endpointPublished`), so something really listens
+   there. The derived-name fallback cannot tell a legacy peer that listens from
+   a live session that never bound, and skipping a fleet for the second one
+   loses the answers entirely.
+
+The same answer gates both fleets: `subagentFleetDeferredToPeer()` is what
+`enabledAuxiliaryLspServerIds()` reads for the auxiliaries and what
+`LSPService.touchFile` reads for the primary language server, so a covered child
+starts no language server of its own for a diagnostics or sync touch. A
+covered child's per-file diagnostics touch is still answered locally when the
+caller already learned that the peer did not answer THESE bytes
+(`LSPTouchFileOptions.peerAnswerUnavailable`, passed by the dispatch LSP runner,
+the `lens_diagnostics` collection path and the workspace sweep): root coverage
+is not byte coverage, and a skipped touch there would answer nothing at all.
 
 At `session_start` (the same boundary that refreshes the LSP budget degrade) a
 subagent session reads the instance registry through its own root accessors:
@@ -136,13 +152,17 @@ the one comparator. It then asks warm attach, through
 reads; the attached incumbent must be one of the live peers found on that root.
 Everything unknown — an unreadable or torn registry, a guessed root, a probe
 that has not answered yet, no attachment, an attachment for another root, an
-attached process that is not the root's peer — enables the fleet, so a
-delegated child keeps its own opengrep/ast-grep/typos/zizmor instead of silently
-scanning nothing. Each subagent session writes one
+attached process that is not the root's peer, an incumbent that published no
+endpoint — enables the fleets, so a delegated child keeps its own
+opengrep/ast-grep/typos/zizmor and its own primary language server instead of
+silently scanning nothing. Each subagent session writes one
 `subagent_auxiliary_peer_coverage` row (`latency.log`, claimed once per session
 root) with `peerCovered`, `peerCount`, `registryEntries`, `attached`,
-`attachedRootMatches` and `attachedIncumbentPid`, so the trade is observable
-from the log rather than inferred from the absence of findings.
+`attachedRootMatches`, `attachedEndpointPublished` and `attachedIncumbentPid`,
+so the trade is observable from the log rather than inferred from the absence of
+findings. A deferred primary fleet also writes one
+`lsp-primary-fleet-deferred-to-peer` ledger row per covered root, so a session
+that stopped paying for a language server says why.
 
 The decision is cached for the synchronous dispatch gate but bound to the ROOT
 it was computed for, and re-validated on every read: a read compares that root
@@ -168,10 +188,11 @@ listener, recording `warm-attach-socket-mode-unrestricted`, so every session
 there runs its own fleets — the fail-safe direction.
 
 **Cost for a child without coverage.** A subagent that is not attached to a
-working peer — no peer on its root, a peer whose answer for a file failed, a
-detached or exited incumbent — runs its own opengrep/ast-grep/zizmor/typos
-fleet instead of scanning nothing. Children stay light in every other way (LSP
-pre-warm and the eight heavyweight startup scans are still skipped), and
+working peer — no peer on its root, a peer that published no endpoint, a peer
+whose answer for a file failed, a detached or exited incumbent — runs its own
+opengrep/ast-grep/zizmor/typos and its own primary language server instead of
+scanning nothing. Children stay light in every other way (LSP pre-warm and the
+eight heavyweight startup scans are still skipped), and
 `PI_LENS_SUBAGENT_FULL=1` remains the explicit opt-in to the full fleet
 everywhere.
 

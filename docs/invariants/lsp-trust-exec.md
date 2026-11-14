@@ -322,22 +322,39 @@
   warm attachment or `touchFile`; an over-bound file returns a `too_large`
   result with its byte/line measurement and records
   `lsp-diagnostics-file-too-large` once per file per session.
-- Warm attach is the plugin's decision, not a setting (`configureWarmAttach`,
-  `clients/warm-attach.ts`). Every session BINDS its diagnostics endpoint and
-  publishes it in its instance-registry entry; a SUBAGENT attaches to a live peer
-  registered on its own EXACT root only when that peer published the endpoint it
-  bound (`WarmAttachAttachment.endpointPublished`), because a peer that never
-  bound answers nothing. A primary session binds but never attaches: it owns its
-  fleets, so reading a peer's answers while running its own would be two servers
-  for one tree. `PI_LENS_WARM_ATTACH=1` restores the pre-default behavior (attach
-  whatever the role) and `PI_LENS_WARM_ATTACH=0` opts out. This is also what makes
-  the existing subagent auxiliary peer-coverage skip reachable on a default host,
-  where it used to require the opt-in. The bound socket is narrowed to `0600`
-  right after `listen` (Node creates it with `0777 & ~umask`, and this channel
-  carries file bytes); a host where that narrowing fails closes the listener,
-  publishes nothing and records `warm-attach-socket-mode-unrestricted`, so every
-  session there runs its own fleets. Proven by
-  `tests/clients/warm-attach.test.ts`.
+- A subagent whose own exact root a live peer serves runs no language server of
+  its own. The primary fleet and the auxiliary fleet read ONE coverage answer,
+  `subagentFleetDeferredToPeer` (`clients/dispatch/auxiliary-lsp.ts`), published
+  at `session_start` from the instance registry and re-validated on every read;
+  the primary gate sits on `touchFile` (`clients/lsp/index.ts`). Coverage needs a
+  peer registered on that EXACT root — a containing root is another tree — and
+  an attachment to it that published the endpoint it bound
+  (`WarmAttachAttachment.endpointPublished`), because a peer that never bound
+  cannot answer, and skipping a fleet for it loses the answers entirely. Any
+  doubt re-arms the session toward ENABLED, once, with one
+  `subagent_auxiliary_peer_coverage_rearmed` row: detached, another root, a
+  changed or exited incumbent, or an unreadable registry. The gate is narrow: an
+  explicit `clientScope: "all"` sweep and an `explicitQuery` still ask this
+  process's own servers, and an explicit LSP feature request (navigation,
+  rename) spawns through `getClientForFile` untouched. Warm attach is the
+  plugin's default (`configureWarmAttach`: every session binds and publishes,
+  only a SUBAGENT attaches, and `PI_LENS_WARM_ATTACH=0` opts out) exactly so a
+  borrowed attachment is real; a primary session never skips on a subagent's
+  claim. Proven by `tests/clients/lsp/primary-fleet-peer-deferral.test.ts`,
+  `tests/clients/dispatch/auxiliary-lsp-peer-coverage.test.ts` and
+  `tests/clients/warm-attach.test.ts`. Two limits complete the rule. Root
+  coverage is not byte coverage: the caller that already asked the peer about
+  these bytes and got no usable answer passes
+  `LSPTouchFileOptions.peerAnswerUnavailable` (the dispatch LSP runner, the
+  `lens_diagnostics` collection path and the workspace sweep in
+  `clients/lsp/index.ts`), and that touch always runs a server here — otherwise
+  the runner reports `skipped`/`unstarted` and the finding is lost. And the
+  endpoint every session now binds is owner-only: `startServer` narrows the
+  socket file to `0600` right after `listen` (Node creates it with
+  `0777 & ~umask`, and the channel carries file bytes), and a host where that
+  fails closes the listener, publishes nothing and records
+  `warm-attach-socket-mode-unrestricted`, so every session there runs its own
+  fleets.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.

@@ -926,6 +926,10 @@ async function collectDiagnosticsForFile(
 	// array copies; confirmation was added when Marksman's lower-level clean verdict
 	// proved that a successful empty collection also needs explicit provenance.
 	let touched: TouchFileResult | undefined;
+	// T1 of odd/tasks/lsp-fleet-memory: set when the warm incumbent was asked
+	// about THESE bytes and did not answer them. The local touch below then runs
+	// a real server instead of deferring to the fleet that owns the root.
+	let peerAnswerUnavailable = false;
 	try {
 		content = fs.readFileSync(absPath, "utf-8");
 		const contentLimit = explicitQuery
@@ -959,6 +963,7 @@ async function collectDiagnosticsForFile(
 				attachedBudgetMs,
 				"sweep",
 			);
+			peerAnswerUnavailable = attached?.available !== true;
 			if (attached?.available) {
 				// #4944: the incumbent answers every auxiliary; a switched-off one's
 				// rows and coverage-gap name are not this check's answer.
@@ -1017,6 +1022,11 @@ async function collectDiagnosticsForFile(
 			collectDiagnostics: true,
 			maxClientWaitMs: waitMs,
 			...(explicitQuery && { explicitQuery }),
+			// The peer answer this query already tried was unusable for these bytes
+			// (or the warm route threw), so this touch may not be skipped in favour
+			// of a fleet that did not answer: the file's cleanliness is reported by
+			// a server that ran here.
+			peerAnswerUnavailable,
 			source: "lsp_diagnostics",
 			clientScope: serverScope,
 			excludeServerIds,

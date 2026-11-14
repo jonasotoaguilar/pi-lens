@@ -15,6 +15,11 @@
   bind only from a live primary `SessionScope`; `clients/process-bridge.ts`
   accepts only a strictly newer scope ticket, so a concurrent secondary or
   stale activation cannot rebind a held bridge/task to its runtime (#4258).
+- A subagent that defers its language server to a live peer records the skip
+  once per root as `lsp-primary-fleet-deferred-to-peer` (`recordDegradationOnce`,
+  subject = the covered root), beside the coverage decision's own
+  `subagent_auxiliary_peer_coverage` phase row and the rearm row that says which
+  premise failed.
 - Session degradation uses the ledger's bounded once/count APIs and resets at
   the correct primary session boundary. `SessionStartClassification`
   (`clients/session-lifecycle.ts`): `primary` and `sequential-replacement`
