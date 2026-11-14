@@ -322,6 +322,22 @@
   warm attachment or `touchFile`; an over-bound file returns a `too_large`
   result with its byte/line measurement and records
   `lsp-diagnostics-file-too-large` once per file per session.
+- Warm attach is the plugin's decision, not a setting (`configureWarmAttach`,
+  `clients/warm-attach.ts`). Every session BINDS its diagnostics endpoint and
+  publishes it in its instance-registry entry; a SUBAGENT attaches to a live peer
+  registered on its own EXACT root only when that peer published the endpoint it
+  bound (`WarmAttachAttachment.endpointPublished`), because a peer that never
+  bound answers nothing. A primary session binds but never attaches: it owns its
+  fleets, so reading a peer's answers while running its own would be two servers
+  for one tree. `PI_LENS_WARM_ATTACH=1` restores the pre-default behavior (attach
+  whatever the role) and `PI_LENS_WARM_ATTACH=0` opts out. This is also what makes
+  the existing subagent auxiliary peer-coverage skip reachable on a default host,
+  where it used to require the opt-in. The bound socket is narrowed to `0600`
+  right after `listen` (Node creates it with `0777 & ~umask`, and this channel
+  carries file bytes); a host where that narrowing fails closes the listener,
+  publishes nothing and records `warm-attach-socket-mode-unrestricted`, so every
+  session there runs its own fleets. Proven by
+  `tests/clients/warm-attach.test.ts`.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.

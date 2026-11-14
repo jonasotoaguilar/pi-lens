@@ -70,9 +70,10 @@ the marker only feeds `isSubagentSession()`:
   one-per-session light-mode notice.
 - `enabledAuxiliaryLspServerIds()` skips opengrep, ast-grep, zizmor and typos
   (`clients/dispatch/auxiliary-lsp.ts`) ONLY while a live peer instance is
-  registered on the child's own project root AND warm attach is attached to
-  that peer for that root — see "Peer coverage" below. Without warm attach the
-  child runs its own fleet.
+  registered on the child's own project root AND this session is attached to a
+  fleet that can answer for it — see "Peer coverage" below. Warm attach is the
+  plugin's default now, so this skip is reachable on a default host, where it
+  used to need `PI_LENS_WARM_ATTACH=1`.
 - The turn-end LSP idle reset takes the shortened derivation
   (`getEffectiveLspIdleResetMs()`, `clients/runtime-turn.ts`) instead of the
   base one (#713). Both derivations floor at the full-scan wall-clock ceiling,
@@ -120,7 +121,8 @@ The skip is therefore conditioned on real peer coverage rather than on the
 marker alone, and it needs TWO premises — a registered fleet is not the same
 fact as an obtainable one:
 
-1. a LIVE peer instance holds the child's own project root, and
+1. a LIVE peer instance holds the child's own project root, exactly (a
+   containing root is another tree), and
 2. warm attach is attached to that peer for that same root, so the child
    actually reads that fleet's answers.
 
@@ -135,8 +137,8 @@ reads; the attached incumbent must be one of the live peers found on that root.
 Everything unknown — an unreadable or torn registry, a guessed root, a probe
 that has not answered yet, no attachment, an attachment for another root, an
 attached process that is not the root's peer — enables the fleet, so a
-delegated child keeps its own opengrep/ast-grep/typos/zizmor instead of
-silently scanning nothing. Each subagent session writes one
+delegated child keeps its own opengrep/ast-grep/typos/zizmor instead of silently
+scanning nothing. Each subagent session writes one
 `subagent_auxiliary_peer_coverage` row (`latency.log`, claimed once per session
 root) with `peerCovered`, `peerCount`, `registryEntries`, `attached`,
 `attachedRootMatches` and `attachedIncumbentPid`, so the trade is observable
@@ -153,14 +155,25 @@ to ENABLED — once, permanently for that session, with one
 is deliberately one-way: a session that has re-armed never flaps back to a
 silent skip.
 
-**Cost for a child without warm attach.** The skip is now unavailable to every
-subagent session that is not warm-attached, which is the default: warm attach
-is opt-in behind `PI_LENS_WARM_ATTACH=1`. Such a child runs its own
-opengrep/ast-grep/zizmor/typos fleet — real server processes and their
-rule/dictionary compilation — instead of scanning nothing. Children stay light
-in every other way (LSP pre-warm and the eight heavyweight startup scans are
-still skipped), and `PI_LENS_SUBAGENT_FULL=1` remains the explicit opt-in to the
-full fleet everywhere.
+**Warm attach is the default, not a configuration.** The lever is the plugin's
+(T1 of `odd/tasks/lsp-fleet-memory`), so `PI_LENS_WARM_ATTACH` is only an escape
+hatch: unset means every session BINDS and publishes its own diagnostics
+endpoint, and a subagent attaches to a live peer on its exact root that
+published the endpoint it bound. A primary session binds but never attaches (it
+owns its fleets), `PI_LENS_WARM_ATTACH=1` restores the old explicit behavior
+(attach whatever the role), and `PI_LENS_WARM_ATTACH=0` opts out entirely. The
+bound socket is narrowed to `0600` after `listen`, because it carries file
+bytes; a host where that narrowing fails publishes nothing and closes the
+listener, recording `warm-attach-socket-mode-unrestricted`, so every session
+there runs its own fleets — the fail-safe direction.
+
+**Cost for a child without coverage.** A subagent that is not attached to a
+working peer — no peer on its root, a peer whose answer for a file failed, a
+detached or exited incumbent — runs its own opengrep/ast-grep/zizmor/typos
+fleet instead of scanning nothing. Children stay light in every other way (LSP
+pre-warm and the eight heavyweight startup scans are still skipped), and
+`PI_LENS_SUBAGENT_FULL=1` remains the explicit opt-in to the full fleet
+everywhere.
 
 Cross-worktree consequence: two worktrees of one clone are two project roots,
 so the child's root is normally uncovered and the child runs its own fleet.

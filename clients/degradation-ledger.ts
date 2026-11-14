@@ -2221,6 +2221,18 @@ export type DegradationKind =
 	 */
 	| "warm-attach-socket-error"
 	/**
+	 * `warm-attach-socket-mode-unrestricted`: F2 of T1 in
+	 * odd/tasks/lsp-fleet-memory: this host bound the warm diagnostics endpoint
+	 * but could not narrow it to its owner (`chmod 0600` failed), so the listener
+	 * was closed and nothing was published. Node creates a Unix socket with
+	 * `0777 & ~umask` and a socket is connectable by whoever may write it, so a
+	 * `umask 002` host would have exposed a channel that carries file BYTES to
+	 * every local user. Subject is the project root that session tried to serve,
+	 * recorded once per root per session; the fallback is safe and visible —
+	 * every session runs its own language servers.
+	 */
+	| "warm-attach-socket-mode-unrestricted"
+	/**
 	 * `warm-ipc-endpoint-missing`: #3255: nothing is listening on the pid-scoped warm endpoint this session
 	 * derived for its incumbent, while the instance registry still confirms that
 	 * incumbent is alive. Narrowing the workspace-id case fold renamed the

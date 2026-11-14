@@ -514,7 +514,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/tree-sitter-client.ts": 6,
 		"clients/tree-sitter-logger.ts": 1,
 		"clients/tree-sitter-symbol-extractor.ts": 3,
-		"clients/warm-attach.ts": 14,
+		// 14 -> 16 (F2 of T1 in odd/tasks/lsp-fleet-memory): the socket-mode
+		// refusal arm catches the chmod failure and names it through the module's
+		// existing `error` parameter, in the catch and in the phase row it records.
+		"clients/warm-attach.ts": 16,
 		"clients/word-index-logger.ts": 1,
 		"clients/word-index.ts": 2,
 		// #5417: `SourceWriteExit`'s thrown `error`.
@@ -1705,7 +1708,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// the module's existing `record` helper.
 		"clients/test-runner-delivery.ts": 16,
 		"clients/turn-summary.ts": 4,
-		"clients/warm-attach.ts": 9,
+		// 9 -> 13 (T1 of odd/tasks/lsp-fleet-memory): `configureWarmAttach`'s
+		// default arm ends local for two reasons of its own — a primary session
+		// that owns its fleet, and an incumbent that published no endpoint — and
+		// the socket-mode refusal reports its cause and its `disabled` outcome.
+		// All four name themselves through the module's existing `record` helper,
+		// so one `lsp_warm_attach` row says why this session published nothing or
+		// kept its own fleet.
+		"clients/warm-attach.ts": 13,
 		"clients/write-source-file.ts": 2,
 		"tools/lens-diagnostic-mark.ts": 1,
 		"tools/lsp-diagnostics.ts": 1,

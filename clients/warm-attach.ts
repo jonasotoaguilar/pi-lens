@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import {
@@ -41,6 +42,7 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { normalizeFilePath } from "./path-utils.js";
+import { isSubagentSession } from "./subagent-mode.js";
 
 interface AttachState {
 	cwd?: string;
@@ -282,7 +284,37 @@ async function serveRequest(
 	};
 }
 
-function startServer(cwd: string): void {
+/**
+ * The ONE call that narrows a bound endpoint to its owner (F2 of T1 in
+ * odd/tasks/lsp-fleet-memory). Node creates a Unix socket with
+ * `0777 & ~umask`, and a socket is connectable by whoever may write it — this
+ * channel carries file BYTES, so `umask 002` would expose every project it
+ * touches to every local user. 0600 leaves the socket name and the published
+ * endpoint string untouched and only removes the group/other bits.
+ *
+ * A module-level binding rather than a call site so the refusal arm has a
+ * driver: chmod on a file this process owns succeeds on every supported host, so
+ * nothing but an injected refusal reaches it (`_setWarmAttachSocketModeForTests`,
+ * the `_set…ForTests` convention this module already uses).
+ */
+let setSocketMode: (endpoint: string) => void = (endpoint) => {
+	fs.chmodSync(endpoint, 0o600);
+};
+
+/**
+ * Bind the diagnostics endpoint for `cwd` and publish it, or bind nothing.
+ *
+ * Returns `false` when a listener could not be restricted to its owner: that
+ * host gets no listener and no published endpoint, so every session (this one
+ * and its children) runs its own language servers — the fail-safe direction,
+ * and the one a child already fails toward.
+ *
+ * The mode is taken right after `listen` returns: Node binds a Unix socket
+ * synchronously there, so the file the OS accepted already exists. A host where
+ * the bind were deferred (a clustered worker) fails the chmod, closes the
+ * listener and publishes nothing, which is the same safe answer.
+ */
+function startServer(cwd: string): boolean {
 	state.server?.close();
 	const endpoint = diagnosticsIpcPathForCwd(cwd, process.pid);
 	// THE name this process binds, unlinked and published. Node refuses a
@@ -363,11 +395,65 @@ function startServer(cwd: string): void {
 	});
 	server.listen(bound);
 	server.unref();
+	if (!restrictEndpointToOwner(bound, cwd)) {
+		server.close();
+		// One bounded row: the refusal is a property of the host, not of a file,
+		// so the subject is the root this session tried to serve.
+		recordDegradationOnce({
+			kind: "warm-attach-socket-mode-unrestricted",
+			subject: cwd,
+			reason:
+				"the bound diagnostics endpoint could not be restricted to its owner (chmod 0600 failed), so nothing is published and this session runs its own language servers",
+		});
+		record("disabled", cwd, "socket-mode-unrestricted");
+		return false;
+	}
 	state.server = server;
 	// The name the OS accepts for this listener, cut once here rather than
 	// recomputed by every reader (#4353). A peer whose `os.tmpdir()` differs —
 	// every Gentle Shell child — reads it from this process's registry entry.
 	publishDiagnosticsEndpoint(bound);
+	return true;
+}
+
+/** Narrow a bound listener to its owner, or report that this host cannot.
+ *  Windows binds a named pipe, which has no file mode to narrow. */
+function restrictEndpointToOwner(bound: string, cwd: string): boolean {
+	if (process.platform === "win32") return true;
+	try {
+		setSocketMode(bound);
+		return true;
+	} catch (error) {
+		record("mode-refused", cwd, String(error));
+		return false;
+	}
+}
+
+/**
+ * How this process participates in the warm channel.
+ *
+ * - `"off"`: `PI_LENS_WARM_ATTACH=0`. It binds nothing and publishes nothing.
+ * - `"explicit"`: `PI_LENS_WARM_ATTACH=1`, the pre-default opt-in. It binds, and
+ *   it attaches to a live same-root peer whatever its role (a primary session
+ *   included), which is the behavior that switch always meant.
+ * - `"default"`: anything else, which is now the common case. The plugin
+ *   decides (S2 of odd/tasks/lsp-fleet-memory), not the user: EVERY session
+ *   binds its diagnostics endpoint, and a SUBAGENT attaches when a live peer on
+ *   its own exact root published the endpoint it bound. A primary session never
+ *   attaches on the default arm: it owns its fleet (the primary-session guard),
+ *   so reading a peer's answers while running its own would be two servers for
+ *   one tree.
+ *
+ * Why the parent's bind is part of the default: a child can only skip its own
+ * primary language server when SOMETHING answers for its root, and the borrowed
+ * attachment is that answer. Without the parent binding, a child's attachment
+ * would name a peer that listens nowhere — the trap T1 of that ODD names. So the
+ * bind is unconditional on the default arm and the attach is the narrow half.
+ */
+function warmAttachMode(): "off" | "explicit" | "default" {
+	const configured = process.env.PI_LENS_WARM_ATTACH;
+	if (configured === "0") return "off";
+	return configured === "1" ? "explicit" : "default";
 }
 
 export async function configureWarmAttach(cwd: string): Promise<void> {
@@ -375,14 +461,15 @@ export async function configureWarmAttach(cwd: string): Promise<void> {
 	state.incumbentPid = undefined;
 	state.incumbentEndpoint = undefined;
 	state.local = true;
-	// Before the opt-in check: a session that binds nothing (opt-in off, a rebind
-	// that fails) publishes nothing, so a child of it falls back to derivation.
+	// Before anything binds: a session that binds nothing (opt-out, failed
+	// rebind) publishes nothing, so a child of it falls back to derivation.
 	publishDiagnosticsEndpoint(undefined);
-	if (process.env.PI_LENS_WARM_ATTACH !== "1") {
-		record("disabled", state.cwd, "opt-in-not-enabled");
+	const mode = warmAttachMode();
+	if (mode === "off") {
+		record("disabled", state.cwd, "opt-out");
 		return;
 	}
-	startServer(state.cwd);
+	if (!startServer(state.cwd)) return;
 	const incumbent = selectWarmAttachIncumbent(
 		await readInstanceRegistry(),
 		state.cwd,
@@ -391,10 +478,38 @@ export async function configureWarmAttach(cwd: string): Promise<void> {
 		record("local", state.cwd, "no-live-incumbent");
 		return;
 	}
+	if (mode === "default" && !isSubagentSession()) {
+		// The primary-session guard: this process owns its fleet, so a peer's
+		// answers are never a substitute for its own servers.
+		record("local", state.cwd, "primary-session-runs-own-fleet");
+		return;
+	}
+	if (mode === "default" && !incumbentServes(incumbent)) {
+		// Proof of a listener, not merely a live pid. A peer that published no
+		// endpoint never bound one, so an implicit attachment to it would borrow
+		// answers that do not exist; run our own fleet instead.
+		record("local", state.cwd, "incumbent-serves-no-endpoint");
+		return;
+	}
 	state.incumbentPid = incumbent.pid;
 	state.incumbentEndpoint = incumbent.diagnosticsEndpoint;
 	state.local = false;
 	record("attached", state.cwd, undefined, incumbent.pid);
+}
+
+/**
+ * Whether a peer PROVED it listens: it published the endpoint it bound
+ * (`InstanceEntry.diagnosticsEndpoint`, written where the listener binds). An
+ * entry without one never bound, or predates the field, and the derived-name
+ * fallback cannot tell those apart — which is exactly why the impLicit arm of
+ * {@link configureWarmAttach} refuses it and the explicit opt-in keeps the
+ * derivation.
+ */
+function incumbentServes(incumbent: InstanceEntry): boolean {
+	return (
+		incumbent.diagnosticsEndpoint !== undefined &&
+		incumbent.diagnosticsEndpoint.length > 0
+	);
 }
 
 export async function tryWarmAttachedDiagnostics(
@@ -490,6 +605,15 @@ export interface WarmAttachAttachment {
 	root: string;
 	/** The instance whose servers answer this session's requests. */
 	incumbentPid: number;
+	/**
+	 * Whether that instance PUBLISHED the endpoint it bound
+	 * (`InstanceEntry.diagnosticsEndpoint`). This is the difference between an
+	 * attachment that can be dialed and one that merely names a live pid, and a
+	 * caller that SKIPS work on the strength of the attachment (the primary and
+	 * auxiliary fleet gates, `clients/dispatch/auxiliary-lsp.ts`) has to read it:
+	 * a borrowed fleet nobody listens for is not coverage.
+	 */
+	endpointPublished: boolean;
 }
 
 /**
@@ -504,7 +628,13 @@ export function warmAttachAttachment(): WarmAttachAttachment | undefined {
 		state.cwd === undefined
 	)
 		return undefined;
-	return { root: state.cwd, incumbentPid: state.incumbentPid };
+	return {
+		root: state.cwd,
+		incumbentPid: state.incumbentPid,
+		endpointPublished:
+			state.incumbentEndpoint !== undefined &&
+			state.incumbentEndpoint.length > 0,
+	};
 }
 
 function promoteToLocal(reason: string): void {
@@ -516,7 +646,20 @@ function promoteToLocal(reason: string): void {
 	record("takeover", state.cwd ?? process.cwd(), reason, pid);
 }
 
+/** Test-only: drive the socket-mode refusal arm (F2 of T1 in
+ *  odd/tasks/lsp-fleet-memory). Passing nothing restores the real `chmod`. */
+export function _setWarmAttachSocketModeForTests(
+	mode: ((endpoint: string) => void) | undefined,
+): void {
+	setSocketMode =
+		mode ??
+		((endpoint) => {
+			fs.chmodSync(endpoint, 0o600);
+		});
+}
+
 export function _resetWarmAttachForTests(): void {
+	_setWarmAttachSocketModeForTests(undefined);
 	state.server?.close();
 	state.server = undefined;
 	state.cwd = undefined;
@@ -545,6 +688,9 @@ export function _setWarmAttachForTests(
 	incumbentPid: number,
 	incumbentEndpoint?: string,
 ): void {
+	// `incumbentEndpoint` is what the incumbent PUBLISHED in production; omitting
+	// it models a peer that bound nothing (or predates the field), which the
+	// fleet gates read as `endpointPublished: false`.
 	state.cwd = path.resolve(cwd);
 	state.incumbentPid = incumbentPid;
 	state.incumbentEndpoint = incumbentEndpoint;
