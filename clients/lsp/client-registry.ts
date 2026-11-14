@@ -28,6 +28,7 @@ import {
 	isProjectLocalBinPath,
 } from "../package-manager.js";
 import { isWithinForm, normalizeMapKey } from "../path-utils.js";
+import { cachedPrimarySpawnRefusal } from "../lsp-budget.js";
 import {
 	assertInstallAllowed,
 	isLspSpawnAllowedByTrust,
@@ -1336,6 +1337,28 @@ export class ClientRegistry {
 			if (isOptionalServer) this.optionalDisabled.delete(key);
 		}
 
+		// T3 of odd/tasks/lsp-fleet-memory: the fleet budget admits the PRIMARY
+		// language server too. This is the ONE place a new primary process is
+		// decided, and it is reached only when a spawn would start: the warm-reuse
+		// return above already served every session that owns a live client, so a
+		// keystroke that finds one pays nothing here. Placed deliberately AFTER the
+		// cheap local declinations (a declined root, an adopted-root refusal, a
+		// breaker cooldown) — a spawn those already refuse must not be recorded as a
+		// budget refusal — and BEFORE the spawn gate below, whose
+		// `makeCapacityForClient` can EVICT a live client: a spawn this refuses must
+		// never cost another client its server. Joining a spawn already in flight
+		// starts no process, so it is admitted: there is nothing to shed there.
+		//
+		// The answer is SYNCHRONOUS, from the decision `session_start` already took
+		// (`cachedPrimarySpawnRefusal`), so this adds no await — and therefore no
+		// interleaving change — to a seam whose in-flight spawn ordering is pinned.
+		//
+		// Auxiliaries keep their own owner. `enabledAuxiliaryLspServerIds`
+		// (clients/dispatch/auxiliary-lsp.ts) already returns no ids under the same
+		// decision, so re-deciding it here would be a second answer to one question.
+		if (!isAuxiliary(server) && !this.inFlight.has(key)) {
+			if (cachedPrimarySpawnRefusal()) return undefined;
+		}
 		// #2064: did THIS caller start the language-server process, or did it
 		// join a spawn another caller already had in flight? The answer is only
 		// knowable here, before the await — downstream of `await spawnPromise`

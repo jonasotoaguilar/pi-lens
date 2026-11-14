@@ -355,6 +355,37 @@
   fails closes the listener, publishes nothing and records
   `warm-attach-socket-mode-unrestricted`, so every session there runs its own
   fleets.
+- The cross-process fleet budget (`clients/lsp-budget.ts`) admits the PRIMARY
+  language server as well as the auxiliaries. `cachedPrimarySpawnRefusal` is
+  read by `ClientRegistry.ensureClientForServer` on the ONE path that would
+  start a process: after the warm-reuse return, so a session keeps answering
+  from the servers it already owns, and after every cheap policy declination,
+  so a spawn those already refuse is never recorded as a budget refusal. It
+  sits BEFORE the spawn gate's capacity eviction, so a refused spawn never
+  costs another client its server. The refusal fires when the session's own
+  root is at its root ceiling, the machine is at its stop, or the RSS stop
+  tripped, and it degrades only: it closes, kills and steals nothing, and no
+  other instance's server is touched. One `lsp-primary-spawn-refused-by-budget`
+  row per refusing root (`recordDegradationOnce`, subject the charged root)
+  names the root and the ceiling. It answers from the `session_start` verdict
+  only, synchronously and with no disk read on the spawn path, and a process
+  with no verdict is never gated on registry state it never asked for. Joining
+  a spawn already in flight starts no process and is
+  admitted; auxiliaries keep their own owner
+  (`enabledAuxiliaryLspServerIds`). One named excluded default: a root INSIDE
+  its own share still starts no new primary once the MACHINE is at its stop
+  (`DEFAULT_LSP_BUDGET_CEILING`, 64 at the defaults, against a root budget of
+  16). That is deliberate — a ceiling that may never evict another instance's
+  live server can only turn the newcomer away — and its population is every
+  primary the session has not started yet: one per untouched language, and the
+  whole primary fleet of a session that starts while the machine is already at
+  the stop. Servers the session already owns keep answering. The escapes are
+  `PI_LENS_LSP_BUDGET_CEILING`, `PI_LENS_LSP_BUDGET_ROOT_CEILING`,
+  `PI_LENS_LSP_BUDGET_RSS_MB` (off while unset), `PI_LENS_CROSS_PROCESS_BUDGET=0`
+  and `PI_LENS_INSTANCE_REGISTRY=0`;
+  `PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS` only shortens the idle reset. Proven by
+  `tests/clients/lsp/primary-spawn-budget-gate.test.ts` and
+  `tests/clients/lsp/client-registry-direct.test.ts`.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.

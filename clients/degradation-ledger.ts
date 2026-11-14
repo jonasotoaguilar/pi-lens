@@ -1223,6 +1223,26 @@ export type DegradationKind =
 	 */
 	| "lsp-primary-fleet-deferred-to-peer"
 	/**
+	 * `lsp-primary-spawn-refused-by-budget`: T3 of odd/tasks/lsp-fleet-memory: a
+	 * session that is already over its LSP share — its own root at the root
+	 * budget, the machine-wide stop, or the machine RSS stop — refused to start
+	 * its next PRIMARY language server. The row names the root that was charged
+	 * and the ceiling that refused it, because the absent language server is the
+	 * thing a later reader has to be able to explain.
+	 *
+	 * Recorded once per refusing session root per session: a session that keeps
+	 * asking keeps one row. The ceiling and the basis that row names are the ones
+	 * that refused it FIRST — a root refused by its own root budget and later by
+	 * the machine stop keeps the root-ceiling row, and the later cause adds no
+	 * second row, so a reader must not take one row per root as one cause per
+	 * root. It is a DEGRADATION, never an eviction — servers this
+	 * session already owns keep running (a warm touch never reaches the spawn
+	 * path), and no other instance's server is closed, killed or stolen. Distinct
+	 * from `lsp-primary-fleet-deferred-to-peer`, which is about a PEER answering
+	 * the same root rather than about a budget refusing growth.
+	 */
+	| "lsp-primary-spawn-refused-by-budget"
+	/**
 	 * `lsp-probe-finding-policy`: #3071: `tools/lsp-diagnostics.ts`'s probe-disposition filter threw while
 	 * applying policy to a batch of findings; the batch is returned unfiltered
 	 * (nothing suppressed) rather than dropped. Subject is the cwd.

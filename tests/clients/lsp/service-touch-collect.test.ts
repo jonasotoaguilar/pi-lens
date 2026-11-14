@@ -133,6 +133,20 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
 
 		try {
+			// T3 of odd/tasks/lsp-fleet-memory: the fleet budget now admits the
+			// PRIMARY server too, so a pressed session starts no new language
+			// server at all — a touch under pressure cannot spawn the client whose
+			// pull-only behaviour this case is about. Obtain the client FIRST (the
+			// session inside budget), then apply the pressure: `preferPullOnly` is a
+			// property of the client this session already owns, which is exactly the
+			// population the degrade mechanism still reaches.
+			await service.touchFile(FILE, "print('x')\n", {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 25,
+				source: "test",
+			});
+			vi.mocked(client.waitForDiagnostics).mockClear();
 			await checkCrossProcessLspBudget({
 				registry: [
 					{

@@ -32,11 +32,13 @@
  *   (several roots at their full budget, or a leak). Headroom is deliberate: a
  *   legitimate fan-out of small children can never trip it, and the designed
  *   remedy for machine-wide pressure is the root that exceeds its share
- *   shedding, not an innocent latecomer. `PI_LENS_LSP_BUDGET_CEILING` still
+ *   shedding. That preference is about the AUXILIARY shed; the PRIMARY refusal
+ *   cannot honour it, because it may not evict a live server, and the cost is
+ *   named as an excluded default below. `PI_LENS_LSP_BUDGET_CEILING` still
  *   caps the machine, and `PI_LENS_LSP_BUDGET_ROOT_CEILING` the single root.
  *
- * Excluded defaults, both deliberate and both named here because the rule reads
- * narrower than the machine it guards:
+ * Excluded defaults, all three deliberate and all named here because the rule
+ * reads narrower than the machine it guards:
  *
  * - A session that cannot name its own root keeps the pre-split machine-wide
  *   rule at the SMALLER of the two ceilings: it cannot prove it is under its
@@ -46,15 +48,58 @@
  * - RSS pressure stays machine-wide. It measures the machine's real memory, and
  *   no per-root share can bound that; a root under its LSP count budget still
  *   degrades when the aggregate is over the configured RSS ceiling.
+ * - A root that is INSIDE its own share still starts no new primary server once
+ *   the MACHINE is at its stop, and that is deliberate rather than an
+ *   oversight. A ceiling that may never evict, close or steal another
+ *   instance's live server can only refuse the newcomer, so the run-wide stop
+ *   turns away a session whose own root is well under its share — the trade the
+ *   per-root split buys, taken knowingly. Population at the defaults
+ *   (`rootCeiling` 16, machine stop 64 = 16 x 4): every primary THIS session has
+ *   not started yet — one per language it has not yet touched, and, for a
+ *   session that starts while the machine is already at the stop, its whole
+ *   primary fleet (its servers for the languages of the files it opens,
+ *   typically one to three). Servers it already owns are never touched: the
+ *   refusal is about new spawns. The escapes, all verified against this file:
+ *   `PI_LENS_LSP_BUDGET_CEILING` (the machine stop),
+ *   `PI_LENS_LSP_BUDGET_ROOT_CEILING` (one root's budget),
+ *   `PI_LENS_LSP_BUDGET_RSS_MB` (the memory stop, off while unset),
+ *   `PI_LENS_CROSS_PROCESS_BUDGET=0` (this module off, every reader answers
+ *   "admitted") and `PI_LENS_INSTANCE_REGISTRY=0` (no registry read, so no
+ *   verdict is ever taken). `PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS` is NOT an
+ *   escape: it only shortens this session's idle reset.
  *
- * Degrade mechanism: skip spawning AUXILIARY LSP servers (role:"auxiliary" in
- * clients/lsp/server.ts — opengrep, ast-grep, zizmor, typos, marksman) for the
- * remainder of THIS session, keeping only the primary language server per file.
- * Auxiliaries are cross-cutting scanners layered on top of (not required for)
- * core diagnostics, so this is the cheapest, highest-signal thing to shed under
- * pressure. The cached decision also shortens this session's idle reset and lets
- * pull-capable servers skip their push fallback. All three degrade mechanisms
- * read the same session-boundary snapshot; pressure never changes mid-touch.
+ * Degrade mechanisms, cheapest first. All four read the same decision:
+ *
+ * - skip spawning AUXILIARY LSP servers (role:"auxiliary" in
+ *   clients/lsp/server.ts — opengrep, ast-grep, zizmor, typos, marksman) for the
+ *   remainder of THIS session. Auxiliaries are cross-cutting scanners layered on
+ *   top of (not required for) core diagnostics, so this is the cheapest,
+ *   highest-signal thing to shed under pressure (`shouldDegradeAuxiliaryLsp`,
+ *   read by `clients/dispatch/auxiliary-lsp.ts`);
+ * - refuse this session's NEXT PRIMARY spawn (T3 of
+ *   odd/tasks/lsp-fleet-memory, `cachedPrimarySpawnRefusal`, read by
+ *   `ClientRegistry.ensureClientForServer` right before it would start a
+ *   process). DEGRADE, NEVER EVICT: the refusal is about new spawns only. Every
+ *   server this session already owns keeps running and keeps answering — a
+ *   warm touch returns the live client before the spawn path is ever reached —
+ *   and this module never closes, kills or steals another instance's live
+ *   server. No server is preempted; a session that is over its share simply
+ *   stops ADDING to it;
+ * - shorten this session's idle reset;
+ * - let pull-capable servers skip their push fallback.
+ *
+ * The primary refusal's population is every primary spawn this session would
+ * start, with no caller-side door left out: an explicit `lens_diagnostics`
+ * query, a `clientScope: "all"` sweep, an explicit navigation/rename request
+ * and the quick-mode prewarm all acquire through the same spawn path, and the
+ * remedy for a root over its share is that the root stops growing. Joining a
+ * spawn another caller already has in flight is NOT refused — no process is
+ * started there, so there is nothing to shed.
+ *
+ * The gate sits BEFORE the registry's capacity eviction: a spawn it refuses must
+ * never cost another client its server. It is answered synchronously from the
+ * decision `session_start` already took (`cachedPrimarySpawnRefusal`), so the
+ * spawn path gains no await and no interleaving change.
  *
  * Kill switch: `PI_LENS_CROSS_PROCESS_BUDGET=0` disables this module
  * entirely (every session always spawns its full fleet, today's behavior) —
@@ -62,6 +107,7 @@
  * (session-lifecycle.ts / runtime-config.ts).
  */
 
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	getAuthoritativeInstanceRoots,
 	getInstanceRoots,
@@ -140,6 +186,9 @@ export interface LspBudgetDecision {
 	/** Live LSP children charged to this session's own root — the largest of its
 	 *  roots when it serves several. Absent when the session named none. */
 	ownRootLoad?: number;
+	/** The root key that carried {@link ownRootLoad}, named so a refusal record
+	 *  spells the root the decision actually measured. Absent with no named root. */
+	ownRootKey?: string;
 	ownRootOverBudget: boolean;
 	machineOverBudget: boolean;
 	/** The count-based verdict this session applies: its own root against
@@ -156,8 +205,29 @@ export interface LspBudgetDecision {
 	 *  independently-triggered mechanism without every caller needing to
 	 *  re-derive it from `overBudget`. */
 	degradeAuxiliary: boolean;
+	/** T3: refuse this session's next PRIMARY spawn. Equal to `overBudget`
+	 *  today, broken out for the same reason as `degradeAuxiliary`: the spawn
+	 *  gate reads ITS mechanism, not a re-derived verdict. */
+	degradePrimarySpawn: boolean;
 	shortenIdleTimeout: boolean;
 	preferPullOnly: boolean;
+}
+
+/** Why this session's next primary spawn is refused, and the ceiling that
+ *  refused it. Read from the decision, never re-derived at the spawn site. */
+export interface LspPrimarySpawnRefusal {
+	/** The session root the decision charged, in its normalized identity form.
+	 *  Empty only for a session that named no root at all (see {@link basis}). */
+	root: string;
+	/** The ceiling that refused, in that basis's own unit: live LSP servers for
+	 *  `"root"` and `"machine"`, bytes for `"rss"`. */
+	ceiling: number;
+	/** Which stop refused: this root's share, the machine-wide backstop, the
+	 *  machine RSS stop, or — for a session that named no root — the pre-split
+	 *  machine-wide rule at the smaller of the two count ceilings. */
+	basis: "root" | "machine" | "rss" | "unrooted";
+	/** The load measured on that basis's axis when the decision was taken. */
+	load: number | undefined;
 }
 
 export interface LspBudgetOptions {
@@ -249,10 +319,15 @@ export function decideLspBudget(
 		);
 	}
 	const ownRoots = ownRootKeys(options.ownRoots);
-	const ownRootLoad =
-		ownRoots === undefined
-			? undefined
-			: Math.max(...ownRoots.map((key) => loadByRoot.get(key) ?? 0));
+	let ownRootKey: string | undefined;
+	let ownRootLoad: number | undefined;
+	for (const key of ownRoots ?? []) {
+		const load = loadByRoot.get(key) ?? 0;
+		if (ownRootLoad === undefined || load > ownRootLoad) {
+			ownRootLoad = load;
+			ownRootKey = key;
+		}
+	}
 	const ownRootOverBudget =
 		ownRootLoad !== undefined && ownRootLoad >= rootCeiling;
 	const machineOverBudget = totalLiveLspServers >= machineCeiling;
@@ -293,6 +368,7 @@ export function decideLspBudget(
 		rootCeiling,
 		ownRoots,
 		ownRootLoad,
+		ownRootKey,
 		ownRootOverBudget,
 		machineOverBudget,
 		countOverBudget,
@@ -301,6 +377,7 @@ export function decideLspBudget(
 		rssPressure,
 		overBudget,
 		degradeAuxiliary: overBudget,
+		degradePrimarySpawn: overBudget,
 		shortenIdleTimeout: overBudget,
 		preferPullOnly: overBudget,
 	};
@@ -332,6 +409,121 @@ export function shouldShortenLspIdleTimeout(): boolean {
 
 export function shouldPreferPullOnlyDiagnostics(): boolean {
 	return cachedDecision?.preferPullOnly ?? false;
+}
+
+/**
+ * The refusal this session's CACHED decision implies for a new PRIMARY spawn,
+ * or `undefined` while the spawn is admitted.
+ *
+ * Pure over the decision: the spawn site never asks "is this root full" itself
+ * (a re-derived rule beside its owner is defect shape 83), it asks the module
+ * that already accounted for the root. The basis is named in the order the
+ * module's own remedy prefers: this root's share first (the root that exceeds
+ * it is the one that sheds), then the machine-wide stop, then the RSS stop.
+ */
+function primarySpawnRefusal(
+	decision: LspBudgetDecision,
+): LspPrimarySpawnRefusal | undefined {
+	if (!decision.degradePrimarySpawn) return undefined;
+	const root = decision.ownRootKey ?? "";
+	if (decision.ownRootOverBudget) {
+		return {
+			root,
+			ceiling: decision.rootCeiling,
+			basis: "root",
+			load: decision.ownRootLoad,
+		};
+	}
+	if (decision.machineOverBudget) {
+		return {
+			root,
+			ceiling: decision.ceiling,
+			basis: "machine",
+			load: decision.totalLiveLspServers,
+		};
+	}
+	if (decision.rssPressure) {
+		return {
+			root,
+			ceiling: decision.rssCeilingBytes ?? 0,
+			basis: "rss",
+			load: decision.totalRssBytes,
+		};
+	}
+	// The pre-split rule for a session that named no root: the total against the
+	// smaller of the two count ceilings (see the module docstring).
+	return {
+		root,
+		ceiling: Math.min(decision.rootCeiling, decision.ceiling),
+		basis: "unrooted",
+		load: decision.totalLiveLspServers,
+	};
+}
+
+/** The bounded record's reason. It names BOTH facts the refusal must carry: the
+ *  root it was charged to and the ceiling that refused it. */
+function primarySpawnRefusalReason(refusal: LspPrimarySpawnRefusal): string {
+	const charged =
+		refusal.root.length > 0
+			? `root ${refusal.root}`
+			: "this session (no root named)";
+	switch (refusal.basis) {
+		case "root":
+			return `${charged} already runs ${refusal.load ?? 0} LSP servers, at or over its ceiling of ${refusal.ceiling}, so this process starts no new primary language server`;
+		case "machine":
+			return `the machine already runs ${refusal.load ?? 0} LSP servers, at or over its ceiling of ${refusal.ceiling}, so ${charged} starts no new primary language server`;
+		case "rss":
+			return `the machine's LSP footprint is ${refusal.load ?? 0} bytes, at or over its ceiling of ${refusal.ceiling} bytes, so ${charged} starts no new primary language server`;
+		case "unrooted":
+			return `${charged} must stay under ${refusal.ceiling} LSP servers and the machine already runs ${refusal.load ?? 0}, so it starts no new primary language server`;
+		default:
+			// Total by construction: the union above is exhaustive, and a value that
+			// reached here anyway is reported with its own numbers rather than
+			// silently dropped.
+			return `${charged} is over its LSP ceiling of ${refusal.ceiling}, so it starts no new primary language server`;
+	}
+}
+
+/**
+ * The refusal this session's CACHED decision implies for a new PRIMARY spawn,
+ * or `undefined` while the spawn is admitted.
+ *
+ * Called from the one place a new primary process is decided
+ * (`ClientRegistry.ensureClientForServer`, before its spawn gate and before its
+ * capacity eviction), so it never runs on a warm touch. SYNCHRONOUS on purpose:
+ * it answers from the decision the budget module already took and reads no
+ * file, so it adds no await — and therefore no interleaving change — to a seam
+ * whose in-flight spawn ordering is itself pinned.
+ *
+ * Fails toward today's behaviour in every doubtful case, like every other
+ * reader here: the kill switch (`PI_LENS_CROSS_PROCESS_BUDGET=0`), a disabled
+ * instance registry, and no decision yet all answer "admitted". That last one
+ * is also what keeps this hermetic: a process that never checked the budget
+ * (every test fixture, and a prewarm that beats `session_start`'s check) is
+ * never gated on registry state it did not ask for.
+ *
+ * A refusal is written ONCE per refusing session root
+ * (`lsp-primary-spawn-refused-by-budget`), so a session that keeps trying keeps
+ * one row; the row names the root and the ceiling, which is what makes the
+ * absence of a language server explicable later.
+ */
+export function cachedPrimarySpawnRefusal():
+	| LspPrimarySpawnRefusal
+	| undefined {
+	if (!isCrossProcessBudgetEnabled() || !isInstanceRegistryEnabled()) {
+		return undefined;
+	}
+	const decision = cachedDecision;
+	if (decision === undefined) return undefined;
+	const refusal = primarySpawnRefusal(decision);
+	if (refusal === undefined) return undefined;
+	const subject = refusal.root.length > 0 ? refusal.root : "";
+	recordDegradationOnce({
+		kind: "lsp-primary-spawn-refused-by-budget",
+		subject,
+		reason: primarySpawnRefusalReason(refusal),
+	});
+	return refusal;
 }
 
 /** Test-only: reset the module-scope cache between tests. */
