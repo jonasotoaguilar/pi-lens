@@ -61,7 +61,7 @@ import {
 	resolveLspServerCwd,
 	type LSPServerInfo,
 } from "./server.js";
-import { isAuxiliary } from "./server-traits.js";
+import { isAuxiliary, type LspLaunchVariant } from "./server-traits.js";
 import {
 	getSessionRootsForTelemetry,
 	isOutsideAllSessionRoots,
@@ -132,6 +132,71 @@ export function mergeInitializationOptions(
 	if (!override) return base;
 	if (!base) return override;
 	return deepMergeObjects(base, override);
+}
+
+/**
+ * The admitted `tsserver.path` a built-in blob carries, when it carries one.
+ * #4299: this is the ONE key of a classic launch's initialization blob a user
+ * override must never win, because it names the compiler the wrapper is allowed
+ * to fork.
+ */
+function admittedTsserverPath(
+	initialization: Record<string, unknown> | undefined,
+): string | undefined {
+	const tsserver = initialization?.tsserver;
+	if (
+		tsserver === null ||
+		typeof tsserver !== "object" ||
+		Array.isArray(tsserver)
+	) {
+		return undefined;
+	}
+	const admitted = (tsserver as Record<string, unknown>).path;
+	return typeof admitted === "string" && admitted ? admitted : undefined;
+}
+
+/**
+ * Merge a launch's built-in initializationOptions with the user's
+ * `serverOverrides` entry.
+ *
+ * Two rules meet here, and the classic variant is the only launch where they
+ * collide (#4299, fleet-memory T2 review):
+ *
+ * - `ServerInitOverride.initializationOptions` (`clients/lsp/config.ts`)
+ *   promises user values win on key conflicts at every nesting level. The
+ *   classic blob carries the tsserver topology policy, which picks no
+ *   executable — only whether the wrapper forks a syntax child — so it is a
+ *   default the user may change.
+ * - The same blob carries the admitted `tsserver.path`, which DOES pick the
+ *   executable the wrapper forks, so that key must survive merging.
+ *
+ * The classic variant therefore takes the documented user-wins merge and then
+ * re-pins only the admitted path. Every other launch keeps the built-in-wins
+ * order it has always had.
+ */
+function mergeSpawnInitializationOptions(
+	launchVariant: LspLaunchVariant | undefined,
+	builtIn: Record<string, unknown> | undefined,
+	user: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	if (launchVariant !== "classic") {
+		return mergeInitializationOptions(builtIn, user);
+	}
+	const merged = mergeInitializationOptions(builtIn, user);
+	const admittedPath = admittedTsserverPath(builtIn);
+	if (!admittedPath) return merged;
+	const mergedTsServer = merged?.tsserver;
+	return {
+		...merged,
+		tsserver: {
+			...(mergedTsServer !== null &&
+			typeof mergedTsServer === "object" &&
+			!Array.isArray(mergedTsServer)
+				? (mergedTsServer as Record<string, unknown>)
+				: {}),
+			path: admittedPath,
+		},
+	};
 }
 
 export const BROKEN_BASE_COOLDOWN_MS = 15_000;
@@ -1510,17 +1575,15 @@ export class ClientRegistry {
 
 			const override = getServerInitOverride(server.id, filePath);
 			// #4299: the compiler owner's admitted path must survive config
-			// merging; otherwise the wrapper can fork a different compiler.
-			const mergedInit =
-				spawned.launchVariant === "classic"
-					? mergeInitializationOptions(
-							override?.initializationOptions,
-							spawned.initialization,
-						)
-					: mergeInitializationOptions(
-							spawned.initialization,
-							override?.initializationOptions,
-						);
+			// merging, or the wrapper can fork a different compiler. That is the ONE
+			// key the classic launch re-pins over the user's tree; every other key,
+			// the tsserver topology policy included, follows the documented
+			// precedence (user wins). See `mergeSpawnInitializationOptions`.
+			const mergedInit = mergeSpawnInitializationOptions(
+				spawned.launchVariant,
+				spawned.initialization,
+				override?.initializationOptions,
+			);
 			// A replacement process is a new first-contact identity even when the
 			// configured server id is unchanged. Re-arm both capability latches before
 			// the replacement can publish a snapshot.

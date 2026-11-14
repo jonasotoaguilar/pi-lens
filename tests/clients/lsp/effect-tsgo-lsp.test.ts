@@ -181,7 +181,9 @@ describe("effect-tsgo selection (#4914)", () => {
 		expect(launchLSPMock.mock.calls[0]?.[0]).toBe(wrapper);
 		expect(launchLSPMock.mock.calls[0]?.[0]).not.toBe(effect);
 		expect(spawned?.launchVariant).toBe("classic");
-		expect(spawned?.initialization).toEqual({ tsserver: { path: tsserver } });
+		expect(spawned?.initialization).toEqual({
+			tsserver: { path: tsserver, useSyntaxServer: "never" },
+		});
 	});
 
 	it("uses a hoisted @effect/tsgo that sits beside the hoisted TypeScript 7", async () => {

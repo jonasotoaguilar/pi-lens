@@ -3027,6 +3027,69 @@ const TypeScriptRoot: RootFunction = withRootMarkers(
 	[...TS_CONFIG_MARKERS, ...TS_TOOLING_MARKERS],
 );
 
+/**
+ * The tsserver process topology a TypeScript launch runs, named in the one
+ * `lsp_typescript_spawn_topology` record per launch (fleet-memory T2).
+ *
+ * `semantic-only` = pi-lens set the classic wrapper's
+ * {@link CLASSIC_TSSERVER_USE_SYNTAX_SERVER} policy, so it forks ONE
+ * full-semantic `tsserver` per root. The wrapper's syntax child is a latency
+ * split for syntax-only requests, never a capability: the semantic child
+ * answers every feature, so switching the split off removes a process, not a
+ * feature.
+ *
+ * `single-process` = the launch has no syntax/semantic option to set: the
+ * typescript-go entrypoint (`tsc --lsp`) and its `effect-tsgo` wrapper run one
+ * child process. Asking them for a policy would invent a flag they do not read.
+ */
+export type TypeScriptSpawnTopology = "semantic-only" | "single-process";
+
+/**
+ * The `tsserver` initialization option the classic wrapper reads. Measured on
+ * the pinned wrapper (`typescript-language-server` 5.3.0,
+ * `clients/installer/index.ts`): its `toSyntaxServerConfiguration` maps
+ * `"never"` to `SyntaxServerConfiguration.Never`, which `getCompositeServerType`
+ * turns into its single-server topology, while `"auto"` — the wrapper's own
+ * default — forks a `--serverMode partialSemantic` syntax child beside the
+ * semantic one.
+ *
+ * Measured cost of leaving that default in place (fleet-memory baseline E4b):
+ * one TypeScript root ran three processes and 412 MB — wrapper 73 MB,
+ * `partialSemantic` 156 MB, full semantic 182 MB — while `instances.json`
+ * `lspChildCount` reported 1, because it counts the child pi-lens spawns and
+ * not the wrapper's own forks. pi-lens decides the topology instead of
+ * inheriting it.
+ */
+export const CLASSIC_TSSERVER_USE_SYNTAX_SERVER = "never" as const;
+
+/**
+ * The one record naming which TypeScript launch variant ran and the tsserver
+ * process topology pi-lens asked it for (fleet-memory T2). One row per launch:
+ * the spawn path runs once per server instance, so the row is bounded by the
+ * launches themselves, and it is the only place the chosen topology is
+ * observable — the child census cannot see a wrapper's own forks.
+ */
+function recordTypeScriptSpawnTopology(
+	root: string,
+	variant: LspLaunchVariant,
+	topology: TypeScriptSpawnTopology,
+): void {
+	logLatency({
+		type: "phase",
+		phase: "lsp_typescript_spawn_topology",
+		filePath: root,
+		durationMs: 0,
+		metadata: {
+			tool: "typescript",
+			variant,
+			topology,
+			// The claim the topology choice must never quietly break: every LSP
+			// feature the variant's server advertises is still served.
+			features: "all",
+		},
+	});
+}
+
 export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
 	idleEviction: "transparent",
@@ -3071,6 +3134,7 @@ export const TypeScriptServer: LSPServerInfo = {
 				logSessionStart(
 					`lsp typescript-effect-tsgo: version=${effectLsp.releaseTag} typescript=${nativeLsp.version} command=${effectLsp.command}`,
 				);
+				recordTypeScriptSpawnTopology(root, "effect-tsgo", "single-process");
 				return {
 					process: proc,
 					source: "direct",
@@ -3111,6 +3175,7 @@ export const TypeScriptServer: LSPServerInfo = {
 				cwd: root,
 				env,
 			});
+			recordTypeScriptSpawnTopology(root, "native-ts7", "single-process");
 			return { process: proc, source: "direct", launchVariant: "native-ts7" };
 		}
 
@@ -3163,6 +3228,9 @@ export const TypeScriptServer: LSPServerInfo = {
 		// `TSSERVER_PATH` variable is set too, but this wrapper version does not
 		// read it. Both name the same admitted path, so neither an older wrapper
 		// that reads the variable nor this one can fork a different compiler.
+		// The same blob carries the topology decision: the wrapper forks one
+		// full-semantic `tsserver` instead of its default semantic-plus-syntax
+		// pair (see {@link CLASSIC_TSSERVER_USE_SYNTAX_SERVER}).
 		const env = await getToolEnvironment();
 		const proc = await launchLSP(lspPath, ["--stdio"], {
 			cwd: root,
@@ -3172,11 +3240,17 @@ export const TypeScriptServer: LSPServerInfo = {
 			},
 		});
 
+		recordTypeScriptSpawnTopology(root, "classic", "semantic-only");
 		return {
 			process: proc,
 			source,
 			initialization: tsserverPath
-				? { tsserver: { path: tsserverPath } }
+				? {
+						tsserver: {
+							path: tsserverPath,
+							useSyntaxServer: CLASSIC_TSSERVER_USE_SYNTAX_SERVER,
+						},
+					}
 				: undefined,
 			launchVariant: "classic",
 		};

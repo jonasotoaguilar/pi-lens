@@ -2261,12 +2261,11 @@ describe("ClientRegistry.spawnClient success and shutdown guards (#4449)", () =>
 		expect(getFailedLspServerIds()).toEqual(["ts"]);
 	});
 
-	// Recurrence (#4299): a launch variant decides who wins a config conflict. The
-	// default launch lets the user's `serverOverrides` override the server's own
-	// initializationOptions; the classic launch (the compiler owner's admitted
-	// path) must survive config merging, so the server's options win there. No
-	// override at all must not throw. Both orders, and the absent override, had
-	// surviving mutants.
+	// Recurrence (#4299): a launch variant decides who wins a config conflict. A
+	// non-classic launch keeps the server's own initializationOptions over the
+	// user's `serverOverrides`; no override at all must not throw. The classic
+	// launch re-pins only its admitted compiler path (see the two cases below),
+	// so every other key follows the documented user-wins precedence.
 	it("merges a configured init override under the launch variant's precedence", async () => {
 		setProjectTrustState("trusted");
 		const initFor = async (
@@ -2306,7 +2305,7 @@ describe("ClientRegistry.spawnClient success and shutdown guards (#4449)", () =>
 			return handed?.initialization;
 		};
 		expect(await initFor("classic", true)).toEqual({
-			shared: "server",
+			shared: "override",
 			fromServer: 1,
 			fromOverride: 1,
 		});
@@ -2320,6 +2319,91 @@ describe("ClientRegistry.spawnClient success and shutdown guards (#4449)", () =>
 			shared: "server",
 			fromServer: 1,
 		});
+	});
+
+	// Fleet-memory T2 review: the classic launch's built-in blob carries the
+	// tsserver topology policy BESIDE the admitted compiler path.
+	// `ServerInitOverride.initializationOptions` (clients/lsp/config.ts) promises
+	// user values win on key conflicts at every nesting level, and the topology
+	// picks no executable — only whether the wrapper forks a syntax child — so a
+	// user who sets it must not be silently overridden.
+	it("lets a user override choose the tsserver topology for the classic launch", async () => {
+		setProjectTrustState("trusted");
+		const f = ensureFixture("ts");
+		fs.mkdirSync(path.join(f.root, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(
+			path.join(f.root, ".pi-lens/lsp.json"),
+			JSON.stringify({
+				serverOverrides: {
+					ts: {
+						initializationOptions: { tsserver: { useSyntaxServer: "auto" } },
+					},
+				},
+			}),
+		);
+		await initLSPConfig(f.root);
+		f.spawn.mockImplementation(async () => ({
+			process: {
+				process: { killed: false, kill: vi.fn() },
+				stdin: {},
+				stdout: {},
+				stderr: {},
+				pid: 4245,
+			},
+			launchVariant: "classic",
+			initialization: {
+				tsserver: { path: "/admitted/tsserver.js", useSyntaxServer: "never" },
+			},
+		}));
+		await f.ensure();
+		const handed = createLSPClient.mock.calls.at(-1)?.[0] as
+			| { initialization: unknown }
+			| undefined;
+		expect(handed?.initialization).toEqual({
+			tsserver: { path: "/admitted/tsserver.js", useSyntaxServer: "auto" },
+		});
+		resetSessionRootsForTests();
+	});
+
+	// #4299 must survive the fix: the admitted path still wins over whatever the
+	// user's tree says, because it names the compiler the wrapper is allowed to
+	// fork. Only that key is re-pinned; the built-in topology stays a default.
+	it("keeps the admitted tsserver path over a user-supplied one for the classic launch (#4299)", async () => {
+		setProjectTrustState("trusted");
+		const f = ensureFixture("ts");
+		fs.mkdirSync(path.join(f.root, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(
+			path.join(f.root, ".pi-lens/lsp.json"),
+			JSON.stringify({
+				serverOverrides: {
+					ts: {
+						initializationOptions: { tsserver: { path: "/user/tsserver.js" } },
+					},
+				},
+			}),
+		);
+		await initLSPConfig(f.root);
+		f.spawn.mockImplementation(async () => ({
+			process: {
+				process: { killed: false, kill: vi.fn() },
+				stdin: {},
+				stdout: {},
+				stderr: {},
+				pid: 4246,
+			},
+			launchVariant: "classic",
+			initialization: {
+				tsserver: { path: "/admitted/tsserver.js", useSyntaxServer: "never" },
+			},
+		}));
+		await f.ensure();
+		const handed = createLSPClient.mock.calls.at(-1)?.[0] as
+			| { initialization: unknown }
+			| undefined;
+		expect(handed?.initialization).toEqual({
+			tsserver: { path: "/admitted/tsserver.js", useSyntaxServer: "never" },
+		});
+		resetSessionRootsForTests();
 	});
 
 	// Recurrence (#1127 review): a service shut down WHILE the process was spawning
