@@ -255,6 +255,79 @@ both directions, and `tests/clients/subagent-mode.test.ts` pins detection,
 non-`"1"` values, the marker name, the override and the precedence of the two
 older vocabularies when this marker is also set.
 
+## Language-server memory optimizations (this fork)
+
+The fork also carries the fleet-memory series (upstream issue #449): what a
+session pays for language servers, decided by the plugin rather than by a
+setting. Recorded here with the commit that delivered each one.
+
+- **One `tsserver` per TypeScript root** (`71149b8f0`). The classic launch left
+  the process topology to the wrapper, which forks a `--serverMode
+  partialSemantic` syntax child beside the semantic one: three processes and
+  412 MB on one measured root (baseline E4 of `odd/tasks/lsp-fleet-memory.md`),
+  for a latency split that answers no feature. `CLASSIC_TSSERVER_USE_SYNTAX_SERVER`
+  (`"never"`) sets `initializationOptions.tsserver.useSyntaxServer` for the
+  classic variant only, so `native-ts7` and `effect-tsgo` never receive a flag
+  they do not read.
+  `mergeSpawnInitializationOptions` keeps the documented user-wins merge and
+  re-pins only the admitted `tsserver.path`, the key #4299 requires to survive
+  config merging. Every TypeScript launch writes one
+  `lsp_typescript_spawn_topology` row naming the variant, the topology asked for
+  and the all-features claim, because the child census cannot see the wrapper's
+  own forks.
+- **One idle-eviction decision for every root** (`c6b3d95d3`).
+  `ClientRegistry.idleEvictionPolicyFor` answers in one place which layer
+  releases one client, at which bound and under which record: an adopted root
+  keeps its admitted window, a `transparent` server the measured one, an
+  ephemeral root the shorter one, an `unmeasured` server the root idle bound
+  (`DEFAULT_ROOT_IDLE_EVICT_MS`, floored by the full-scan ceiling plus its
+  safety margin), and a `resident` server none. `clients/runtime-turn.ts` reads
+  that bound instead of its own constant, which is gone, so the fleet reset is a
+  backstop that can never be armed shorter than the policy it backs up. The two
+  releases stay distinguishable by record kind (`lsp-idle-eviction` for the
+  transparent/adopted/ephemeral arm, `lsp-root-idle-eviction` for a root's own
+  bound); `lsp-idle-eviction-declined` narrows to a deliberate `resident`
+  declaration.
+- **A covered subagent starts no primary server** (`b6f20ded0`).
+  `LSPService.touchFile` reads `subagentFleetDeferredToPeer()`, the same cached
+  premise `enabledAuxiliaryLspServerIds()` uses, re-validated on every read (see
+  *Peer coverage* above). The three doors that stay ungated are an explicit
+  `clientScope: "all"` sweep, an explicit single-file query, and
+  `peerAnswerUnavailable`. One `lsp-primary-fleet-deferred-to-peer` ledger row
+  per covered root names the reason.
+- **The warm channel is the default** (`da20742b6`). Every session binds its own
+  diagnostics endpoint and publishes the name it bound; a subagent attaches to a
+  live peer on its exact root that published one; a primary session binds but
+  never attaches. `PI_LENS_WARM_ATTACH=1` restores attaching whatever the role
+  and `0` opts out entirely. Node creates the socket at `0777 & ~umask` and it
+  carries file bytes, so it is narrowed to `0600` after `listen`; a host where
+  that fails closes the listener, publishes nothing, and records
+  `warm-attach-socket-mode-unrestricted`.
+- **The budget admits the primary server** (`60351f9f8`, `8aaa1c62f`).
+  `degradePrimarySpawn` in `clients/lsp-budget.ts` refuses the next primary spawn
+  when the session's own root reaches its share or the machine reaches its stop,
+  writes one `lsp-primary-spawn-refused-by-budget` row per refusing root (first
+  cause kept), and closes, evicts or steals nothing. A verdict older than
+  `DEFAULT_LSP_BUDGET_RECHECK_MS` (30 s) is re-read once on the next cold spawn,
+  synchronously from the cache in the common case, and a read that yields
+  nothing keeps the previous verdict. One accepted consequence, named in the
+  module: a root inside its own share still starts no new primary at a machine
+  stop.
+- **One shared single-flight primitive** (`a903b6014`). The mid-session re-check
+  uses `createSingleFlight()` (`clients/single-flight.ts`) instead of a
+  hand-rolled in-flight slot, so concurrent cold spawns share one registry read.
+- **No LSP root inside pi-lens' own data directories** (`96c3d38a2`).
+  `clients/file-utils.ts` owns `piLensDataRoots` and `piLensDataRootContaining`
+  (machine state dir, project data store, legacy `<project>/.pi-lens` arm), and
+  `declinesPiLensDataRoot` refuses a file rooted under one, so the fleet no
+  longer indexes our reports, indexes and snapshots for its whole warm lifetime.
+  `ClientRegistry.declinedRootReason` is the one root-policy answer both the
+  acquisition path and the auxiliary coverage-gap ledger ask, so a scanner
+  declining for policy reads partial rather than clean. One bounded
+  `lsp-root-declined` row names the directory class and the root. A
+  `PILENS_DATA_DIR` that contains the project is excluded on purpose, because
+  that owner stores per project below it.
+
 ## The three env levers
 
 | Env var | Default | Effect |

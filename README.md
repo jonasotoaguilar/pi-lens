@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/apmantza/pi-lens/master/banner.png" alt="pi-lens" width="1100">
+  <img src="https://raw.githubusercontent.com/jonasotoaguilar/pi-lens-gs/master/banner.png" alt="pi-lens" width="1100">
 </p>
 
 # pi-lens
@@ -8,10 +8,13 @@
 
 ## This fork
 
-This is the [jonasotoaguilar](https://github.com/jonasotoaguilar/pi-lens) fork. It tracks
-upstream and adds [Gentle Shell](https://github.com/Gentleman-Programming/gentle-shell)
-support, so Gentle Shell subagents run pi-lens in light mode instead of paying full startup
-cost in every child:
+`pi-lens-gs` is [a fork of pi-lens](https://github.com/apmantza/pi-lens) that adds
+[Gentle Shell](https://github.com/Gentleman-Programming/gentle-shell) compatibility and a set of
+language-server memory optimizations. It tracks upstream and keeps every upstream feature. The
+repository is [jonasotoaguilar/pi-lens-gs](https://github.com/jonasotoaguilar/pi-lens-gs), and
+this is what it adds on top.
+
+### Gentle Shell compatibility
 
 - Gentle Shell marks its child `pi` processes with `GENTLE_PI_AGENTS_CHILD=1`. This fork
   recognizes that marker as a third subagent vocabulary, beside `PI_SUBAGENT_CHILD=1` and
@@ -20,17 +23,16 @@ cost in every child:
   fleet; per-edit diagnostics, formatting, autofix and the symbol indexes stay on.
   `PI_LENS_SUBAGENT_FULL=1` still forces full behavior for every vocabulary.
 - The auxiliary LSP fleet is skipped only while BOTH hold: a live peer instance already covers
-  the child's own project root, and warm attach (`PI_LENS_WARM_ATTACH=1`) is actually attached to
-  that peer for that root, so the child reads that fleet's answers. A child delegated to another
-  worktree (`workspace_root`) or an independent repository (`repository_root`) keeps its own fleet,
-  because no peer serves that tree — and so does a child that is not warm-attached, which is the
-  default. Those children pay for their own opengrep/ast-grep/zizmor/typos servers; every other
-  light-mode saving still applies. The decision is re-checked on each use: without the attachment,
-  or once the incumbent goes away, the session enables its fleet and stays enabled. When the peer
-  check cannot answer, the fleet is enabled: the failure direction costs memory instead of dropping
-  findings.
-- Warm attach (`PI_LENS_WARM_ATTACH=1`) now works between a Gentle Shell child and its parent even
-  though Gentle Shell gives every child its own temporary directory. Each session records the
+  the child's own project root, and warm attach is actually attached to that peer for that root,
+  so the child reads that fleet's answers. A child delegated to another worktree
+  (`workspace_root`) or an independent repository (`repository_root`) keeps its own fleet, because
+  no peer serves that tree, and so does a child that found no attached peer. Those children pay
+  for their own opengrep/ast-grep/zizmor/typos servers; every other light-mode saving still
+  applies. The decision is re-checked on each use: without the attachment, or once the incumbent
+  goes away, the session enables its fleet and stays enabled. When the peer check cannot answer,
+  the fleet is enabled: the failure direction costs memory instead of dropping findings.
+- Warm attach works between a Gentle Shell child and its parent even though Gentle Shell gives
+  every child its own temporary directory. Each session records the
   diagnostics socket it actually listens on, and an attaching session connects to that recorded
   path instead of deriving one from its own tmp root. A peer that records nothing keeps the
   previous derivation, so an older pi-lens degrades to today's behavior instead of dialing a
@@ -50,6 +52,55 @@ cost in every child:
 - A child that loses the race for the machine-global install lock adopts the tool the winner
   installed instead of running the session without it.
 
+### Language-server memory optimizations
+
+A fan-out of sessions used to pay twice for language servers that serve one root. These changes
+move that cost into the plugin's own decisions, so none of them needs a setting:
+
+- One `tsserver` per TypeScript root. The classic TypeScript launch left its process topology to
+  the wrapper, which forked a `partialSemantic` syntax child beside the semantic one: three
+  processes and 412 MB on one measured root, for a latency split that answers no feature. The
+  launch now sets `useSyntaxServer` to `never` on the classic variant only, leaves `native-ts7`
+  and `effect-tsgo` at their exact shape, keeps an explicit `serverOverrides` value winning on
+  merge, and records one `lsp_typescript_spawn_topology` row per launch, because the child
+  census cannot see the wrapper's own forks.
+- One idle-eviction decision for every LSP root. A root whose servers were never measured waited
+  for the process-wide fleet reset, which releases a whole generation and cannot tell one
+  client's last use from another's. `ClientRegistry.idleEvictionPolicyFor` now answers in one
+  place which layer releases a client, at what bound and under which record: an adopted root
+  keeps its admitted window, a `transparent` server the measured one, an ephemeral root the
+  shorter one, an unmeasured server a per-root bound, and a `resident` server none. The turn-end
+  reset reads that same bound, so the backstop can never be armed shorter than the policy it
+  backs up.
+- A covered subagent starts no primary language server. The primary gate reads the same peer
+  coverage answer as the auxiliary fleet, re-validates it on every touch, and re-arms toward
+  running its own fleet once the peer or the attachment goes away. An explicit all-root sweep, an
+  explicit single-file query, and a touch whose peer answer for those bytes already failed stay
+  local, because skipping them would answer a real question with nothing. One
+  `lsp-primary-fleet-deferred-to-peer` row per covered root names the reason.
+- The warm diagnostics channel is the default, not a configuration. Every session binds its own
+  endpoint and publishes the name it bound, so a subagent reaches a live peer on its exact root
+  without setting `PI_LENS_WARM_ATTACH`; a primary session binds but never attaches;
+  `PI_LENS_WARM_ATTACH=1` restores attaching whatever the role, and `0` turns the channel off.
+  The bound socket is narrowed to `0600` because it carries file bytes, and a host where that
+  fails closes the listener and publishes nothing, so every session there runs its own fleets.
+- The fleet budget admits the primary server and re-reads itself mid-session. Pressure used to
+  shed only the auxiliary scanners, so a session whose own root was already at its share still
+  started a full primary server. The budget now refuses that spawn on the one path that would
+  start a process, writes one `lsp-primary-spawn-refused-by-budget` row per refusing root, and
+  closes, evicts or steals no server a session or its peers own. A verdict older than 30 s is
+  re-read once on the next cold spawn, so a session that was inside budget at startup stops
+  starting servers once it is not.
+- Concurrent cold spawns share one budget read. The mid-session re-check uses the repository's
+  shared single-flight primitive instead of a private in-flight slot, so two spawns that arrive
+  together cost one registry read.
+- A language server no longer roots inside pi-lens' own data directories. A file kept under the
+  extension's storage used to root a fleet there, which then indexed our reports, indexes and
+  snapshots for its whole warm lifetime. `clients/file-utils.ts` now owns those directories: the
+  machine state directory, the project data store, and the legacy `<project>/.pi-lens` arm. The
+  root policy declines them with one `lsp-root-declined` row naming the directory class and the
+  root, and a normal project still starts normally.
+
 Details: [docs/subagent-compat.md](docs/subagent-compat.md).
 
 ### Install from this fork
@@ -58,7 +109,7 @@ pi installs a package from a git source, not from `npm`. Point it at the fork an
 builds and loads it:
 
 ```bash
-pi install git:github.com/jonasotoaguilar/pi-lens
+pi install git:github.com/jonasotoaguilar/pi-lens-gs
 ```
 
 If the published package is also configured, remove it so one pi-lens loads:
@@ -68,7 +119,7 @@ pi remove npm:pi-lens
 ```
 
 `pi update --extensions` fetches the fork's default branch. Append `@<commit>` to the source,
-for example `git:github.com/jonasotoaguilar/pi-lens@e3116131d`, to pin one commit instead.
+for example `git:github.com/jonasotoaguilar/pi-lens-gs@e3116131d`, to pin one commit instead.
 
 pi-lens gives AI coding agents fast, language-aware feedback while they write/edit.
 
