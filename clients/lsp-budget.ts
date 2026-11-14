@@ -131,6 +131,7 @@ import {
 	ownPidNamespace,
 	ownProcessStartIfKnown,
 } from "./process-snapshot.js";
+import { createSingleFlight } from "./single-flight.js";
 
 /** Budget for one project root. See the module docstring for the derivation. */
 export const DEFAULT_LSP_BUDGET_ROOT_CEILING = 16;
@@ -410,8 +411,13 @@ let cachedDecision: LspBudgetDecision | undefined;
 /** When {@link cachedDecision} was taken, for the spawn path's bounded re-check. */
 let cachedDecisionAt = 0;
 /** Single flight for the spawn path's re-check: concurrent cold spawns share
- *  one registry read instead of one each. */
-let recheckInFlight: Promise<void> | undefined;
+ *  one registry read instead of one each. The primitive owns the share, the
+ *  clear-on-settle and the successor check (#1753); this module re-checks ONE
+ *  thing, so the key is a constant rather than a family. */
+const primarySpawnRecheck = createSingleFlight<void>();
+
+/** The single-flight key for {@link primarySpawnRecheck}. */
+const PRIMARY_SPAWN_RECHECK_KEY = "primary-spawn";
 
 /** True once the budget check has run this process and found this session over
  *  budget — its own root at the root budget, the machine-wide stop, or RSS
@@ -572,10 +578,9 @@ export function primarySpawnBudgetRecheckDue(): boolean {
 export async function recheckPrimarySpawnBudget(): Promise<
 	LspPrimarySpawnRefusal | undefined
 > {
-	const run = (recheckInFlight ??= checkCrossProcessLspBudget().finally(() => {
-		recheckInFlight = undefined;
-	}));
-	await run;
+	await primarySpawnRecheck.run(PRIMARY_SPAWN_RECHECK_KEY, () =>
+		checkCrossProcessLspBudget(),
+	);
 	return cachedPrimarySpawnRefusal();
 }
 
@@ -583,7 +588,7 @@ export async function recheckPrimarySpawnBudget(): Promise<
 export function _resetLspBudgetDecisionForTests(): void {
 	cachedDecision = undefined;
 	cachedDecisionAt = 0;
-	recheckInFlight = undefined;
+	primarySpawnRecheck.clear();
 }
 
 /** Caller overrides for {@link checkCrossProcessLspBudget}: a pre-read

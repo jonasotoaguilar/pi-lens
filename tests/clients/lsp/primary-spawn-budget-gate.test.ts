@@ -20,7 +20,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -58,7 +66,18 @@ import {
 import { withEnv } from "../../support/with-env.js";
 import { removeTempDirSync } from "../test-utils.js";
 
+// `PI_LENS_TEST_MODE=1` keeps the latency sink's file writes off (#1742) for
+// every case in this file. The value is saved before the write and put back by
+// the FILE-scope teardown below, so a sibling file in this worker never inherits
+// the pin (#4589). The teardown is at file scope on purpose: a teardown nested
+// in the `describe` would not be a prefix of this top-level write.
+const previousTestMode = process.env.PI_LENS_TEST_MODE;
 process.env.PI_LENS_TEST_MODE = "1";
+
+afterAll(() => {
+	if (previousTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
+	else process.env.PI_LENS_TEST_MODE = previousTestMode;
+});
 
 /** This process's parent: a real live pid, never `process.pid` (the comparator
  *  excludes the caller's own entry by definition). */

@@ -1,3 +1,5 @@
+// flake-shape: in-process-mock — createLSPClient wraps the language-server child process (JSON-RPC over stdio), and no shared client double exists: SERVICE_SURFACES registers no factory for LSPClientInfo (tests/support/flake-shape-scan.ts). The subject here is the registry's idle policy over a client whose shutdown is observable at a chosen bound on a fake clock, which a real server child cannot be made to give on demand.
+// flake-shape: service-double — a language-server client is a spawned process; the per-client release is driven by its liveness and busy answers at `ROOT_IDLE_MS`, and only a double can be held idle for exactly one fake-clock tick.
 /**
  * T4 (G4) of odd/tasks/lsp-fleet-memory — the two idle-eviction layers become
  * ONE decision. Before this slice only a `transparent` server (the 20-minute
@@ -38,7 +40,13 @@ import { pinFixtureHome } from "../test-utils.js";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
+// Only the client TRANSPORT is doubled: every other export of the client module
+// stays the real one, so a production route that reaches them does not fail with
+// "not a function" (the vi-mock-export ratchet exists for that regression).
+vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
+	createLSPClient,
+}));
 
 /** The root the case's files live under: absolute, outside tmp, not ephemeral. */
 const ROOT = "/pi-lens-t4-root";

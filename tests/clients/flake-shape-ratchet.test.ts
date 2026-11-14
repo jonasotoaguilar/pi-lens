@@ -470,6 +470,21 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"launchLSP is the child-process boundary and records which command and arguments the production spawn chose; the trust gate beside it in the same module is the real one",
 		},
+	// 2026-11-13 (T4 of odd/tasks/lsp-fleet-memory): the per-client root idle
+	// release is the subject, read from the real registry and the real LSPService
+	// over a client double. SERVICE_SURFACES (`tests/support/flake-shape-scan.ts`)
+	// registers no shared factory for LSPClientInfo, and no real language server
+	// can be held idle for exactly one fake-clock tick, so the client the policy
+	// releases is the one seam that cannot be real here. The same identity pair is
+	// already admitted for the two neighbouring eviction suites below
+	// (`idle-eviction.test.ts`, `idle-eviction-enabled-servers.test.ts`), which
+	// stand in for the same factory for the same reason.
+	"in-process-mock:clients/lsp/root-idle-eviction.test.ts::clients/lsp/client":
+		{
+			detector: "in-process-mock",
+			reason:
+				"createLSPClient wraps the language-server child process; the registry's per-client idle release is the subject, and a real server cannot be made to go idle on a chosen fake-clock tick",
+		},
 	// 2026-10-23 (#4785 F4): the touch's verdict over the real wait, publish
 	// handler and clear; only the client factory, which spawns the server, is
 	// replaced by a client over a real state.
@@ -1798,6 +1813,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "service-double",
 		reason:
 			"the transport double hands back a client that stands in for a running language server; which ids start, and whether an untrusted project may, is decided by the real acquisition",
+	},
+	// 2026-11-13 (T4 of odd/tasks/lsp-fleet-memory): see the in-process-mock
+	// entry for this file. The double's liveness and busy answers are what the
+	// repo's per-client idle policy reads to decide a release, and a real server
+	// process cannot be made to answer them at a chosen bound.
+	"service-double:clients/lsp/root-idle-eviction.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"a language-server client is a spawned process; the per-client root idle release is decided by the liveness and busy answers a real server cannot give on a fake-clock tick",
 	},
 	// 2026-10-23 (#4785 F4): see the in-process-mock entry for this file.
 	"service-double:clients/lsp/touch-cleared-deferred-wait-4785.test.ts::LSPClientInfo":
