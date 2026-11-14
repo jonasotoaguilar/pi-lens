@@ -367,10 +367,11 @@
   tripped, and it degrades only: it closes, kills and steals nothing, and no
   other instance's server is touched. One `lsp-primary-spawn-refused-by-budget`
   row per refusing root (`recordDegradationOnce`, subject the charged root)
-  names the root and the ceiling. It answers from the `session_start` verdict
-  only, synchronously and with no disk read on the spawn path, and a process
-  with no verdict is never gated on registry state it never asked for. Joining
-  a spawn already in flight starts no process and is
+  names the root and the ceiling. The mid-session re-check is
+  `primarySpawnBudgetRecheckDue`: no timer and no per-edit cost, because a
+  verdict older than `DEFAULT_LSP_BUDGET_RECHECK_MS` is re-read once on the next
+  cold spawn, and a process with no verdict is never gated on registry state it
+  never asked for. Joining a spawn already in flight starts no process and is
   admitted; auxiliaries keep their own owner
   (`enabledAuxiliaryLspServerIds`). One named excluded default: a root INSIDE
   its own share still starts no new primary once the MACHINE is at its stop

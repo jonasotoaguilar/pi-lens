@@ -96,10 +96,18 @@
  * spawn another caller already has in flight is NOT refused — no process is
  * started there, so there is nothing to shed.
  *
- * The gate sits BEFORE the registry's capacity eviction: a spawn it refuses must
- * never cost another client its server. It is answered synchronously from the
- * decision `session_start` already took (`cachedPrimarySpawnRefusal`), so the
- * spawn path gains no await and no interleaving change.
+ * WHERE the mid-session re-check lives, and why: at the spawn decision, not on
+ * the touch. The spawn path is reached only when a new process would start, so
+ * a warm edit pays nothing at all (a keystroke that finds a live client never
+ * reaches it), while the case this exists for — a session that was inside
+ * budget at `session_start` and is over it an hour later — is caught exactly
+ * when it matters. `cachedPrimarySpawnRefusal` answers from the decision
+ * already taken and touches no disk, so the common cold spawn adds no await to
+ * the seam; only a decision older than {@link DEFAULT_LSP_BUDGET_RECHECK_MS}
+ * (see `primarySpawnBudgetRecheckDue`) re-reads the registry, once
+ * (single-flight, so concurrent cold spawns share one read). The gate also sits
+ * BEFORE the registry's capacity eviction: a spawn it refuses must never cost
+ * another client its server.
  *
  * Kill switch: `PI_LENS_CROSS_PROCESS_BUDGET=0` disables this module
  * entirely (every session always spawns its full fleet, today's behavior) —
@@ -126,6 +134,12 @@ import {
 
 /** Budget for one project root. See the module docstring for the derivation. */
 export const DEFAULT_LSP_BUDGET_ROOT_CEILING = 16;
+
+/** How long a budget verdict is trusted before the spawn path re-reads the
+ *  registry. A bound on the re-check, not a cache lifetime: the decision is
+ *  still taken once at `session_start` and only RE-decided when a spawn asks
+ *  after this interval, which is why a warm session pays nothing. */
+export const DEFAULT_LSP_BUDGET_RECHECK_MS = 30_000;
 /** How many full-budget roots the machine-wide stop is willing to carry. */
 export const DEFAULT_LSP_BUDGET_MACHINE_HEADROOM = 4;
 /** Machine-wide stop. See the module docstring for why it sits above one root. */
@@ -393,6 +407,11 @@ export function decideLspBudget(
 // toward today's behavior, exactly like the concurrent-session guard.
 
 let cachedDecision: LspBudgetDecision | undefined;
+/** When {@link cachedDecision} was taken, for the spawn path's bounded re-check. */
+let cachedDecisionAt = 0;
+/** Single flight for the spawn path's re-check: concurrent cold spawns share
+ *  one registry read instead of one each. */
+let recheckInFlight: Promise<void> | undefined;
 
 /** True once the budget check has run this process and found this session over
  *  budget — its own root at the root budget, the machine-wide stop, or RSS
@@ -526,9 +545,45 @@ export function cachedPrimarySpawnRefusal():
 	return refusal;
 }
 
+/**
+ * Is this session's cached verdict old enough that the next primary spawn should
+ * re-read it? This is the mid-session re-check's whole schedule: no timer, no
+ * per-edit work, and a session with no decision (or with the budget disabled)
+ * never reaches the disk at all.
+ */
+export function primarySpawnBudgetRecheckDue(): boolean {
+	return (
+		cachedDecision !== undefined &&
+		isCrossProcessBudgetEnabled() &&
+		isInstanceRegistryEnabled() &&
+		Date.now() - cachedDecisionAt >= DEFAULT_LSP_BUDGET_RECHECK_MS
+	);
+}
+
+/**
+ * Re-read the registry and re-cache the verdict, then answer the refusal for the
+ * spawn that asked. Single-flight: concurrent cold spawns inside one window
+ * share one read.
+ *
+ * A read that yields nothing keeps the previous verdict (missing evidence never
+ * upgrades a session to a refusal); a failed read keeps it too, which is exactly
+ * what happens today with no re-check at all.
+ */
+export async function recheckPrimarySpawnBudget(): Promise<
+	LspPrimarySpawnRefusal | undefined
+> {
+	const run = (recheckInFlight ??= checkCrossProcessLspBudget().finally(() => {
+		recheckInFlight = undefined;
+	}));
+	await run;
+	return cachedPrimarySpawnRefusal();
+}
+
 /** Test-only: reset the module-scope cache between tests. */
 export function _resetLspBudgetDecisionForTests(): void {
 	cachedDecision = undefined;
+	cachedDecisionAt = 0;
+	recheckInFlight = undefined;
 }
 
 /** Caller overrides for {@link checkCrossProcessLspBudget}: a pre-read
@@ -583,7 +638,14 @@ export async function checkCrossProcessLspBudget(
 	if (!isCrossProcessBudgetEnabled() || !isInstanceRegistryEnabled()) return;
 	try {
 		const registry = testOverrides.registry ?? (await readInstanceRegistry());
-		if (registry.length === 0) return; // nothing to be over budget against
+		if (registry.length === 0) {
+			// Nothing to be over budget against. The previous verdict (if any) is
+			// kept — missing evidence never upgrades a session to a refusal — but the
+			// stamp moves so the spawn path's re-check does not re-read on every
+			// cold spawn while the registry stays empty.
+			cachedDecisionAt = Date.now();
+			return;
+		}
 		const decision = decideLspBudget(
 			registry,
 			testOverrides.isPidAlive ?? realIsPidAlive,
@@ -597,6 +659,7 @@ export async function checkCrossProcessLspBudget(
 			},
 		);
 		cachedDecision = decision;
+		cachedDecisionAt = Date.now();
 		if (decision.overBudget) {
 			logLatency({
 				type: "phase",

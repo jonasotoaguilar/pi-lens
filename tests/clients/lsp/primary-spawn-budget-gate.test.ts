@@ -1,7 +1,8 @@
 /**
  * T3 (G3) of odd/tasks/lsp-fleet-memory — the cross-process fleet budget
  * (`clients/lsp-budget.ts`) admits the PRIMARY language server, not only the
- * auxiliary fleet.
+ * auxiliary fleet, and re-checks mid-session instead of deciding once at
+ * `session_start`.
  *
  * The subject is the spawn decision, so the observables are the ones a
  * degraded session actually shows: the server's `spawn` (the process that must
@@ -11,9 +12,9 @@
  * servers keep answering (`tests/clients/lsp/client-registry-direct.test.ts`
  * drives that half directly, where a live client exists to keep).
  *
- * The instance registry is the real one on disk (`PI_LENS_HOME`), so a verdict
- * is measured from exactly what another `pi` session would have written. Only
- * the launched binary is doubled (`spawn`), as in
+ * The instance registry is the real one on disk (`PI_LENS_HOME`), so the
+ * mid-session case re-reads exactly what a second `pi` session would have
+ * written. Only the launched binary is doubled (`spawn`), as in
  * `tests/clients/lsp/primary-fleet-peer-deferral.test.ts`.
  */
 import * as fs from "node:fs";
@@ -33,6 +34,7 @@ import {
 	_resetInstanceRegistryEnabledForTests,
 } from "../../../clients/instance-registry.js";
 import {
+	DEFAULT_LSP_BUDGET_RECHECK_MS,
 	_resetLspBudgetDecisionForTests,
 	checkCrossProcessLspBudget,
 } from "../../../clients/lsp-budget.js";
@@ -311,6 +313,36 @@ describe("the fleet budget admits the primary language server", () => {
 		expect(refusalRows()).toHaveLength(1);
 		expect(refusalRows()[0]?.reason).toContain(`ceiling of ${ROOT_CEILING}`);
 		expect(refusalRows()[0]?.reason).not.toContain("the machine already runs");
+	});
+
+	it("re-checks mid-session: a session inside budget at session_start stops spawning primaries once its root goes over, bounded by the re-check interval", async () => {
+		writeRegistry(ROOT_CEILING - 1);
+		await checkCrossProcessLspBudget();
+		await touch("app.ts");
+		expect(spawns.typescript).toHaveBeenCalledTimes(1);
+
+		// The root goes over AFTER the session-boundary decision was taken — the
+		// case the once-per-session check cannot see.
+		writeRegistry(ROOT_CEILING);
+
+		// Still inside the re-check window: the cached verdict stands, and a cold
+		// spawn pays no registry read (this is the bound, not a per-spawn read).
+		await touch("script.py");
+		expect(spawns.python).toHaveBeenCalledTimes(1);
+		expect(refusalRows()).toHaveLength(0);
+
+		// Past the window, the very next spawn re-reads the registry and is
+		// refused by the ceiling the root is over.
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			vi.setSystemTime(Date.now() + DEFAULT_LSP_BUDGET_RECHECK_MS);
+			await touch("main.go");
+		} finally {
+			vi.useRealTimers();
+		}
+		expect(spawns.gopls).not.toHaveBeenCalled();
+		expect(refusalRows()).toHaveLength(1);
+		expect(refusalRows()[0]?.reason).toContain(`ceiling of ${ROOT_CEILING}`);
 	});
 
 	it("leaves the peer gate's answer and its one row untouched for a covered subagent that is also over budget", async () => {

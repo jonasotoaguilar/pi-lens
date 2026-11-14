@@ -28,7 +28,11 @@ import {
 	isProjectLocalBinPath,
 } from "../package-manager.js";
 import { isWithinForm, normalizeMapKey } from "../path-utils.js";
-import { cachedPrimarySpawnRefusal } from "../lsp-budget.js";
+import {
+	cachedPrimarySpawnRefusal,
+	primarySpawnBudgetRecheckDue,
+	recheckPrimarySpawnBudget,
+} from "../lsp-budget.js";
 import {
 	assertInstallAllowed,
 	isLspSpawnAllowedByTrust,
@@ -1349,15 +1353,23 @@ export class ClientRegistry {
 		// never cost another client its server. Joining a spawn already in flight
 		// starts no process, so it is admitted: there is nothing to shed there.
 		//
-		// The answer is SYNCHRONOUS, from the decision `session_start` already took
-		// (`cachedPrimarySpawnRefusal`), so this adds no await — and therefore no
-		// interleaving change — to a seam whose in-flight spawn ordering is pinned.
+		// The common case is a SYNCHRONOUS answer from the decision `session_start`
+		// already took (`cachedPrimarySpawnRefusal`), which is why this adds no
+		// await — and no interleaving change — to the spawn path. Only a verdict
+		// older than the budget's re-check interval costs one registry read
+		// (`primarySpawnBudgetRecheckDue` → `recheckPrimarySpawnBudget`), which is
+		// where the mid-session re-check lives: on the cold path that is about to
+		// start a process, never on a warm edit, so no per-keystroke cost.
 		//
 		// Auxiliaries keep their own owner. `enabledAuxiliaryLspServerIds`
 		// (clients/dispatch/auxiliary-lsp.ts) already returns no ids under the same
 		// decision, so re-deciding it here would be a second answer to one question.
 		if (!isAuxiliary(server) && !this.inFlight.has(key)) {
-			if (cachedPrimarySpawnRefusal()) return undefined;
+			if (primarySpawnBudgetRecheckDue()) {
+				if (await recheckPrimarySpawnBudget()) return undefined;
+			} else if (cachedPrimarySpawnRefusal()) {
+				return undefined;
+			}
 		}
 		// #2064: did THIS caller start the language-server process, or did it
 		// join a spawn another caller already had in flight? The answer is only
