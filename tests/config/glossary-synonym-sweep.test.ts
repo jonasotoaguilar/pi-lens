@@ -1215,7 +1215,13 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lens-map.ts": 14,
 		"clients/log-cleanup.ts": 9,
 		"clients/lsp-mutation.ts": 3,
-		"clients/lsp/client-registry.ts": 2,
+		// 2 -> 4 (#449): the two added uses are one external key, `tsserver.path`
+		// of a classic launch's initialization blob. `admittedTsserverPath` reads
+		// it and `mergeSpawnInitializationOptions` writes it back, the compiler
+		// #4299 keeps over a user override; neither is the delivery path the
+		// glossary retires. The pinned 2 are the `node:path` module (the import
+		// binding and `path.isAbsolute`).
+		"clients/lsp/client-registry.ts": 4,
 		// 0 -> 1 (#4615): the `[lsp-pub]` debug row's `path` member carries the
 		// client's own normalized document key into extension.log. One more
 		// `path` use, same sense (a path value written to a sink), and it is an
@@ -2166,7 +2172,7 @@ describe("glossary synonym-retirement sweep (#3259)", () => {
 
 	it("ignores comments, strings, and template text but counts interpolation code", () => {
 		const source = stripSource(
-			"// warning\n/* warning */ const a = 'warning'; const b = `warning`; const c = `\${warning}`;",
+			"// warning\n/* warning */ const a = 'warning'; const b = `warning`; const c = `${warning}`;",
 			{ strings: "blank" },
 		);
 		expect(countIdentifier(source, "warning")).toBe(1);
