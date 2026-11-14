@@ -72,6 +72,10 @@ import {
 	isOutsideAllSessionRoots,
 } from "./session-roots.js";
 import { recordSuccessfulLspSpawn } from "./spawn-history.js";
+import {
+	getFullScanWallClockMs,
+	SWEEP_IDLE_SAFETY_MARGIN_MS,
+} from "./workspace-sweep-hold.js";
 
 /** Phase A bound: adopted roots are foreign workspaces, not session roots. */
 const ADOPTED_ROOT_CAP = 2;
@@ -251,6 +255,39 @@ const DEFAULT_IDLE_EVICT_MS = 20 * 60_000;
 const DEFAULT_EPHEMERAL_IDLE_EVICT_MS = 60_000;
 
 /**
+ * T4 (G4) of #449: the per-client idle bound for a root whose servers are NOT
+ * `transparent` — i.e. the `unmeasured` default, which is what every
+ * non-`transparent` built-in declares. Before this bound those clients carried
+ * no per-client policy at all and waited for the process-wide fleet reset
+ * (`clients/runtime-turn.ts`), which releases the WHOLE generation on a quiet
+ * turn and cannot tell one client's last use from another's.
+ *
+ * The number is the fleet reset's own base delay, and `runtime-turn` now reads
+ * it from {@link getRootIdleEvictMs} instead of holding a second copy, so the
+ * backstop can never be armed shorter than the policy it backs up.
+ */
+export const DEFAULT_ROOT_IDLE_EVICT_MS = 240_000;
+
+/**
+ * The release reason the `transparent`/adopted/ephemeral policy has always
+ * recorded. Owned here, once, so the two arms of {@link IdleEvictionPolicy}
+ * cannot drift into two spellings of the same event.
+ */
+const IDLE_EVICTION_REASON = "idle LSP client released to bound memory";
+
+/**
+ * T4 (G4, #449): which layer decided one client's idle release, at which
+ * bound, and the record it writes. The `kind` is the discriminator defect shape
+ * 24 requires — two writers that can both release an idle client must be
+ * distinguishable in the ledger, not only in free text.
+ */
+interface IdleEvictionPolicy {
+	readonly idleMs: number;
+	readonly kind: "lsp-idle-eviction" | "lsp-root-idle-eviction";
+	readonly reason: string;
+}
+
+/**
  * #3645: the idle window shared by every server whose registry policy is
  * `transparent`. `PI_LENS_LSP_IDLE_EVICT_MS` is the generic spelling; the
  * original `PI_LENS_TS_IDLE_EVICT_MS` keeps its meaning and is consulted when
@@ -281,6 +318,37 @@ export function getLspIdleEvictMsForRoot(root: string): number {
 	return isEphemeralCheckoutRoot(root)
 		? getEphemeralLspIdleEvictMs()
 		: getLspIdleEvictMs();
+}
+
+/**
+ * The per-client idle bound for a root whose servers are not `transparent`
+ * (see {@link DEFAULT_ROOT_IDLE_EVICT_MS}). `PI_LENS_LSP_ROOT_IDLE_EVICT_MS` is
+ * the probe/test spelling, the same escape hatch `getLspIdleEvictMs` offers; it
+ * is read lazily and never memoized.
+ *
+ * The default is floored by the full workspace sweep's own ceiling (#1618
+ * acceptance criterion 6), exactly as the fleet reset's base delay always was:
+ * a client must never be released mid-sweep, so every idle bound this module
+ * arms outlives `getFullScanWallClockMs()` plus its safety margin. Deriving it
+ * here, once, is what keeps the two layers from drifting apart.
+ */
+export function getRootIdleEvictMs(): number {
+	const parsed = Number.parseInt(
+		process.env.PI_LENS_LSP_ROOT_IDLE_EVICT_MS ?? "",
+		10,
+	);
+	if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+	return Math.max(
+		DEFAULT_ROOT_IDLE_EVICT_MS,
+		getFullScanWallClockMs() + SWEEP_IDLE_SAFETY_MARGIN_MS,
+	);
+}
+
+/** {@link getRootIdleEvictMs}, with a tmp checkout's aggressive window kept. */
+export function getRootIdleEvictMsForRoot(root: string): number {
+	return isEphemeralCheckoutRoot(root)
+		? getEphemeralLspIdleEvictMs()
+		: getRootIdleEvictMs();
 }
 
 export function getLspClientCeiling(): number {
@@ -458,10 +526,12 @@ export class ClientRegistry {
 	 */
 	private readonly clientLeases = new Map<string, number>();
 	/**
-	 * Per-root idle eviction for servers whose registry policy is `transparent`.
-	 * Timers are unref'd so an idle language service cannot keep a one-shot host
-	 * alive, and are removed before shutdown so a concurrent request rebuilds
-	 * instead of receiving the retiring client.
+	 * Per-client idle eviction: one timer per client key, armed at the bound its
+	 * {@link idleEvictionPolicyFor} answer names (a `transparent` server, an
+	 * adopted root, an ephemeral root, or a root's own bound). Timers are unref'd
+	 * so an idle language service cannot keep a one-shot host alive, and are
+	 * removed before shutdown so a concurrent request rebuilds instead of
+	 * receiving the retiring client.
 	 */
 	private readonly idleEvictionTimers = new Map<
 		string,
@@ -808,19 +878,19 @@ export class ClientRegistry {
 	}
 
 	scheduleIdleEviction(key: string, server: LSPServerInfo): void {
-		// The registry owns this policy. Unmeasured and resident servers stay resident.
-		if (
-			server.idleEviction !== "transparent" &&
-			!this.adoptedClientKeys.has(key)
-		) {
+		const policy = this.idleEvictionPolicyFor(key, server);
+		if (!policy) {
 			// #3952: say why no timer was scheduled. Without this row a caller
-			// that ARMS an `unmeasured` server and waits for the eviction (the
+			// that ARMS a `resident` server and waits for the eviction (the
 			// nightly probe's whole protocol) sees the same "nothing happened" as
 			// a server whose timer is merely slow, and the two are opposite
 			// verdicts: `not-evicted` here means the policy was never read off the
 			// object the service holds, which is a pi-lens defect, not a slow
 			// server. Once per server per session: the policy is a declaration, so
 			// one row per (server, session) carries every occurrence's verdict.
+			// T4 (#449) narrowed this branch to `resident` alone: an `unmeasured`
+			// server carries the root idle bound, recorded as
+			// `lsp-root-idle-eviction` when it fires.
 			recordDegradationOnce({
 				kind: "lsp-idle-eviction-declined",
 				subject: server.id,
@@ -830,13 +900,9 @@ export class ClientRegistry {
 		}
 		// Pressure-gating these timers would require a separate reconciliation pass
 		// when the manager crosses the threshold; keep ownership simple and use the
-		// warm-LSP-friendly 20-minute default instead.
+		// warm-LSP-friendly bound the policy names instead.
 		this.clearIdleEvictionTimer(key);
 		const lastUsedAt = this.clientLastUsedAt.get(key) ?? Date.now();
-		const { root } = parseClientKey(key);
-		const idleMs = this.adoptedClientKeys.has(key)
-			? ADOPTED_ROOT_IDLE_EVICT_MS
-			: getLspIdleEvictMsForRoot(root);
 		const timer = setTimeout(() => {
 			this.idleEvictionTimers.delete(key);
 			void this.withClientSpawnGate(async () => {
@@ -863,15 +929,76 @@ export class ClientRegistry {
 					// like the other eviction paths and must not reject from a timer callback.
 				}
 				logSessionStart(`lsp idle eviction: released ${key}`);
+				// T4 (#449): `policy.kind` is the layer discriminator (defect shape 24).
+				// The `transparent`/adopted/ephemeral release keeps `lsp-idle-eviction`;
+				// a root's own bound records `lsp-root-idle-eviction`, so a reader can
+				// tell which decision released the client without parsing free text.
 				recordDegradation({
-					kind: "lsp-idle-eviction",
+					kind: policy.kind,
 					subject: key,
-					reason: "idle LSP client released to bound memory",
+					reason: policy.reason,
 				});
 			}).catch(() => {});
-		}, idleMs);
+		}, policy.idleMs);
 		timer.unref?.();
 		this.idleEvictionTimers.set(key, timer);
+	}
+
+	/**
+	 * T4 (G4, #449): the ONE answer to "may this client be released while idle,
+	 * at which bound, and which layer decides?". The two eviction layers used to
+	 * answer it separately — the registry armed a timer only for `transparent`
+	 * servers and adopted roots, and every other root's clients waited for the
+	 * process-wide fleet reset — so a root whose servers were none of those had
+	 * no per-client policy at all.
+	 *
+	 * The decision, in the order it is taken:
+	 * - an adopted root keeps the adopted window whatever its servers declare (a
+	 *   foreign workspace is bounded by admission, not by a declaration);
+	 * - a `transparent` server keeps the measured window, and an ephemeral root
+	 *   its own shorter one;
+	 * - an `unmeasured` server — the registry default, and every
+	 *   non-`transparent` built-in — carries the root idle bound, so its root is
+	 *   no longer left to the fleet reset alone;
+	 * - a `resident` server carries NO timer: the declaration is deliberate
+	 *   ("kept resident"), so the whole-fleet reset stays its only bound. That is
+	 *   the excluded default, stated rather than silently narrowed, and no
+	 *   built-in declares `resident` today.
+	 *
+	 * A `resident` answer is `undefined`, which the caller records as the #3952
+	 * decline. Every answer keeps the module's existing shutdown reason
+	 * (`idle_eviction`): it is the death-side label for an idle release, and the
+	 * layer is distinguished by the record kind, not by a second spelling of the
+	 * same event.
+	 */
+	private idleEvictionPolicyFor(
+		key: string,
+		server: LSPServerInfo,
+	): IdleEvictionPolicy | undefined {
+		const { root } = parseClientKey(key);
+		if (this.adoptedClientKeys.has(key)) {
+			return {
+				idleMs: ADOPTED_ROOT_IDLE_EVICT_MS,
+				kind: "lsp-idle-eviction",
+				reason: IDLE_EVICTION_REASON,
+			};
+		}
+		if (server.idleEviction === "transparent") {
+			return {
+				idleMs: getLspIdleEvictMsForRoot(root),
+				kind: "lsp-idle-eviction",
+				reason: IDLE_EVICTION_REASON,
+			};
+		}
+		if (server.idleEviction !== "resident") {
+			const idleMs = getRootIdleEvictMsForRoot(root);
+			return {
+				idleMs,
+				kind: "lsp-root-idle-eviction",
+				reason: `root idle bound ${idleMs}ms elapsed for root ${root}; declared ${server.idleEviction ?? "unmeasured"} and respawns on the next request`,
+			};
+		}
+		return undefined;
 	}
 
 	/**

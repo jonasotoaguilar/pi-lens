@@ -164,6 +164,7 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		delete process.env.PI_LENS_LSP_IDLE_EVICT_MS;
 		delete process.env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS;
 		delete process.env.PI_LENS_TS_IDLE_EVICT_MS;
+		delete process.env.PI_LENS_LSP_ROOT_IDLE_EVICT_MS;
 		let pid = 100;
 		spawnedClients.length = 0;
 		createLSPClient.mockImplementation(async () => {
@@ -176,11 +177,12 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 	afterEach(() => {
 		delete process.env.PI_LENS_LSP_IDLE_EVICT_MS;
 		delete process.env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS;
+		delete process.env.PI_LENS_LSP_ROOT_IDLE_EVICT_MS;
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
-	it("evicts an unmeasured server through the service's own timer once armed, then keeps it resident once restored", async () => {
+	it("evicts an unmeasured server through the service's own timer once armed, then hands it to its root idle bound", async () => {
 		const server = registryServer();
 		const { service, driver } = await harness(server, () => [
 			finding(1),
@@ -189,7 +191,7 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		await driver.touch();
 		expect(driver.isTargetAlive()).toBe(true);
 
-		// Unarmed, an unmeasured server is never evicted, however long it idles.
+		// Unarmed, an unmeasured server is not evicted by the transparent window.
 		await vi.advanceTimersByTimeAsync(3 * 60_000);
 		expect(driver.isTargetAlive()).toBe(true);
 
@@ -208,8 +210,16 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		await driver.touch();
 		expect(driver.isTargetAlive()).toBe(true);
 		expect(createLSPClient).toHaveBeenCalledTimes(2);
-		await vi.advanceTimersByTimeAsync(25 * 60_000);
+		// T4 (#449 of odd/tasks/lsp-fleet-memory): `unmeasured` is no longer
+		// unbounded. It carries its own per-client root idle bound, so after the
+		// restore the probe's 20ms window must be GONE (the arm is what this case
+		// guards) while the root bound below is the one that now applies.
+		process.env.PI_LENS_LSP_ROOT_IDLE_EVICT_MS = "120000";
+		await driver.touch();
+		await vi.advanceTimersByTimeAsync(119_000);
 		expect(driver.isTargetAlive()).toBe(true);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(driver.isTargetAlive()).toBe(false);
 		await service.shutdown();
 	});
 

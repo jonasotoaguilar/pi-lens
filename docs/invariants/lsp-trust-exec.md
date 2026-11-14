@@ -133,6 +133,33 @@
   to that adapter and are enforced by oxlint's `no-restricted-imports` in
   `.oxlintrc.json` (`npm run lint:js`, #2372/#277; it replaced the
   `lsp-capabilities-import-sweep` test in #4865).
+- Idle eviction is ONE decision with two layers, and the per-client layer owns
+  it. `ClientRegistry.scheduleIdleEviction` asks `idleEvictionPolicyFor` for the
+  bound and the record kind of one client: an adopted root keeps the adopted
+  window whatever its servers declare, a `transparent` server keeps the measured
+  window (an ephemeral root its own shorter one), an `unmeasured` server — the
+  registry default and every non-`transparent` built-in — carries the ROOT idle
+  bound, and a `resident` declaration arms nothing and stays on the fleet reset.
+  The root bound is `getRootIdleEvictMs()` in `clients/lsp/client-registry.ts`:
+  `max(DEFAULT_ROOT_IDLE_EVICT_MS = 240_000, getFullScanWallClockMs() +
+  SWEEP_IDLE_SAFETY_MARGIN_MS)`, the same derivation the fleet reset's base
+  delay reads, so no per-client bound can be armed shorter than a full workspace
+  sweep (#1618 acceptance criterion 6) and the two layers cannot drift.
+  `PI_LENS_LSP_ROOT_IDLE_EVICT_MS` is its probe/test spelling, like
+  `PI_LENS_LSP_IDLE_EVICT_MS` for the measured window. The process-wide reset
+  (`clients/runtime-turn.ts`) is the BACKSTOP, not the owner: the per-client
+  policy releases each client from its own last use, and the reset covers what a
+  per-client timer cannot — clients a quiet turn never touched, `resident`
+  declarations, and a session whose shorter subagent/budget reset lands first.
+  It clears every per-client timer as it retires the generation, so no client is
+  released twice. The two writers are discriminated by record kind, not prose:
+  a `transparent`/adopted/ephemeral release writes `lsp-idle-eviction` and a
+  root-bound release writes `lsp-root-idle-eviction` (subject `serverId:root`,
+  reason naming the root and the bound), while a `resident` declaration writes
+  `lsp-idle-eviction-declined` once per server per session. Both releases keep
+  the module's one shutdown reason, `idle_eviction`. The per-client policy needs
+  no session-ownership guard because it is armed by client USE, so a fleet in
+  use is never idle; the fleet reset keeps its `isPrimarySession` gate.
 - Idle-eviction policy is the registry's `idleEviction` field, declared per
   server. The nightly (`scripts/measure-lsp-idle-eviction.mjs`) measures every
   registry server's eviction cost and respawn safety into
@@ -155,7 +182,8 @@
   first (history: `HISTORY.md`, 2026-10-19).
   `tests/clients/lsp/lsp-registry-trust.test.ts` pins both directions;
   `scheduleIdleEviction` records `lsp-idle-eviction-declined` once per server
-  per session when it arms no timer.
+  per session when it arms no timer, which after T4 (#449) is a `resident`
+  declaration alone.
 - The server-role vocabulary and the declared trait table have one owner,
   `clients/lsp/server-traits.ts` (#1488, #1756 stage 1). Ask `isAuxiliary`,
   never a comparison against the role literal, and read `notifyInflightLimit`

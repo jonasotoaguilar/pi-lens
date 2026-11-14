@@ -146,9 +146,12 @@ import {
 	type SpawnedServer,
 } from "./client-registry.js";
 export {
+	DEFAULT_ROOT_IDLE_EVICT_MS,
 	getLspClientCeiling,
 	getLspIdleEvictMs,
 	getLspIdleEvictMsForRoot,
+	getRootIdleEvictMs,
+	getRootIdleEvictMsForRoot,
 	mergeInitializationOptions,
 } from "./client-registry.js";
 export type {

@@ -65,6 +65,10 @@ import {
 	runWhenWorkspaceSweepIdle,
 	SWEEP_IDLE_SAFETY_MARGIN_MS,
 } from "./lsp/workspace-sweep-hold.js";
+// T4 (#449): the per-client root idle bound is the owner of the whole-fleet
+// reset's base delay, so the backstop can never be armed shorter than the
+// per-client policy it backs up (one derivation, two readers).
+import { getRootIdleEvictMs } from "./lsp/client-registry.js";
 import { isTestRoleCollateral } from "./collateral-test-role.js";
 import { trivyEvidenceFiles } from "./trivy-client.js";
 import type { TrivyResult } from "./trivy-client.js";
@@ -889,15 +893,33 @@ function scheduleLSPIdleReset(
 // `runWorkspaceDiagnostics`' hold. `SWEEP_IDLE_SAFETY_MARGIN_MS` is
 // single-sourced from `workspace-sweep-hold.ts`, which also uses it for its
 // own max-hold-age failsafe — one tunable, not two.
-const DEFAULT_LSP_IDLE_RESET_MS = 240_000;
-
+//
+// T4 (#449): the BASE delay no longer derives the floor here — it reads
+// `getRootIdleEvictMs()`, whose default derivation is this same expression, so
+// the per-client policy and this backstop share one number instead of two that
+// could drift. The SHORTENED paths below still derive it locally, because a
+// subagent or an over-budget session may legitimately want the fleet gone
+// sooner than the per-client bound; when that happens this reset fires first,
+// clears the per-client timers as it retires the generation, and is therefore
+// the evictor for that session (stated, not incidental).
 function sweepDerivedFloorMs(): number {
 	return getFullScanWallClockMs() + SWEEP_IDLE_SAFETY_MARGIN_MS;
 }
 
-/** The normal (non-subagent, non-budget-pressured) idle-reset delay. */
+/** The normal (non-subagent, non-budget-pressured) idle-reset delay.
+ *
+ * T4 (G4, #449): this is the SAME bound the per-client root idle policy arms
+ * (`getRootIdleEvictMs` in `clients/lsp/client-registry.ts`), read from its
+ * owner rather than re-derived here. That is what makes this reset the
+ * BACKSTOP for a root whose servers are not `transparent` instead of its only
+ * bound: the per-client policy releases each such client at its own last-use
+ * + this delay, and the fleet reset then covers only what a per-client timer
+ * cannot — clients the quiet turn never touched, `resident` declarations, and
+ * a session whose shorter (subagent/budget) reset lands first. It clears every
+ * per-client timer as it tears the generation down, so no client is released
+ * twice. */
 function getBaseLspIdleResetMs(): number {
-	return Math.max(DEFAULT_LSP_IDLE_RESET_MS, sweepDerivedFloorMs());
+	return getRootIdleEvictMs();
 }
 
 /**

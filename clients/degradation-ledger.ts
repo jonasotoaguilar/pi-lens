@@ -1140,14 +1140,16 @@ export type DegradationKind =
 	| "lsp-idle-eviction"
 	/**
 	 * `lsp-idle-eviction-declined`: #3952: `scheduleIdleEviction` was asked to arm a client and DECLINED,
-	 * because the server object the service holds does not declare
-	 * `idleEviction: "transparent"` and the client is not an adopted-root one.
-	 * The pair this row separates is `resident-by-declaration` (a policy answer:
-	 * `unmeasured`/`resident` servers are meant to stay) from
-	 * `not-evicted` (a measurement whose arm never reached the policy), and
+	 * because the server object the service holds declares
+	 * `idleEviction: "resident"` and the client is not an adopted-root one.
+	 * The pair this row separates is `resident-by-declaration` (a policy answer)
+	 * from `not-evicted` (a measurement whose arm never reached the policy), and
 	 * before it both read as "the timer did not fire". Subject is the server id,
 	 * recorded ONCE per server per session: the declaration is the same every
-	 * time, so one row answers for every touch of that server.
+	 * time, so one row answers for every touch of that server. T4 (#449) narrowed
+	 * the population to `resident`: an `unmeasured` server now arms the root idle
+	 * bound and records `lsp-root-idle-eviction` when it fires, so only a
+	 * deliberate "kept resident" declaration reads here.
 	 */
 	| "lsp-idle-eviction-declined"
 	/**
@@ -1312,6 +1314,20 @@ export type DegradationKind =
 	| "lsp-registry-decision"
 	/** `lsp-root-declined`: A host-created pi-agent staging root was declined as an LSP root. */
 	| "lsp-root-declined"
+	/**
+	 * `lsp-root-idle-eviction`: T4 (G4, #449): an idle LSP client was released by
+	 * the PER-CLIENT root idle policy, which covers a root whose servers are not
+	 * `transparent` (the registry's `unmeasured` default, and every
+	 * non-`transparent` built-in). Before this row those clients had no
+	 * per-client bound at all and were released only by the process-wide fleet
+	 * reset, which cannot tell one client's last use from another's. Subject is
+	 * the client key (`serverId:root`) and the reason names the root and the
+	 * bound that elapsed. The sibling `lsp-idle-eviction` carries the
+	 * `transparent`/adopted/ephemeral release, so a reader can tell which layer
+	 * decided (defect shape 24: two releases, two kinds); a `resident` server
+	 * writes neither, and the fleet reset is its only bound.
+	 */
+	| "lsp-root-idle-eviction"
 	| "lsp-scanner-coverage-gap"
 	/**
 	 * `lsp-server-config-load-failed`: #4764: a server reported over `window/showMessage` that its own config or
@@ -2859,14 +2875,17 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// #3952: both are the idle-eviction POLICY answering, not a timer that
 	// failed. `lsp-idle-eviction` is the memory bound releasing a client that
 	// respawns on the next request; `lsp-idle-eviction-declined` is the
-	// declaration `unmeasured`/`resident` doing its job, once per server, so a
-	// nominal session writes up to one row per non-`transparent` server (32 of
-	// the 49 built-ins today). A `⚠` per server on every healthy session is
-	// the cry-wolf shape #2505 rejected; the sibling that DOES stand out is a
-	// measurement whose arm never reached the policy, and that one reads as a
-	// missing row, not as a warning here.
+	// `resident` declaration doing its job, once per server. T4 (#449) adds
+	// `lsp-root-idle-eviction`: the same memory bound, decided per client by a
+	// root's own policy instead of by the process-wide reset — one row per
+	// released client, and only after that client sat unused past its bound. A
+	// `⚠` per client on every healthy session is the cry-wolf shape #2505
+	// rejected; the sibling that DOES stand out is a measurement whose arm never
+	// reached the policy, and that one reads as a missing row, not as a warning
+	// here.
 	"lsp-idle-eviction",
 	"lsp-idle-eviction-declined",
+	"lsp-root-idle-eviction",
 ]);
 
 export function renderDegradationLines(

@@ -231,7 +231,11 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		await service.shutdown();
 	});
 
-	it("keeps an unmeasured server resident", async () => {
+	// T4 (#449): `unmeasured` is not unbounded — it carries the per-client root
+	// idle bound (`root-idle-eviction.test.ts`). What THIS case pins is the
+	// transparent window's own gate: an unmeasured server is never released by the
+	// measured `transparent` policy.
+	it("does not evict an unmeasured server on the transparent window", async () => {
 		vi.useFakeTimers();
 		const client = fakeClient("unmeasured");
 		createLSPClient.mockResolvedValue(client);
